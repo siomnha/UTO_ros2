@@ -7,10 +7,14 @@ uto_planner:
     px4_velocity_topic: /fmu/out/vehicle_odometry
     px4_state_topic: /uto/px4_status
     trajectory_topic: /uto/trajectory
+    execution_command_topic: /uto/execution_command
     diagnostics_topic: /uto/diagnostics
+    resume_service: /uto/resume
     planning_frame: map
+    velocity_frame_alignment_mode: identity
+    velocity_frame_yaw_offset: 0.0
     belief_timeout: 0.30
-    path_timeout: 0.80
+    path_timeout: 2.0
     velocity_timeout: 0.30
     stable_samples: 5
     covariance_eigen_floor: 1.0e-9
@@ -22,6 +26,7 @@ uto_planner:
     regions: 2
     lgr_nodes_per_region: 5
     sigma_count: 7
+    control_check_points_per_region: 31
     lookahead_count: 10
     initial_delay: 0.50
     cold_start_delay: 1.20
@@ -31,6 +36,9 @@ uto_planner:
     validation_time: 0.02
     commit_margin: 0.08
     commit_guard: 0.05
+    commit_position_tolerance: 0.50
+    commit_velocity_tolerance: 0.70
+    commit_attitude_tolerance: 0.25
     terminal_position_tolerance: 0.30
     terminal_velocity_tolerance: 0.05
     process_noise_diagonal: [0.01,0.01,0.01,0.02,0.02,0.02,0.001,0.001,0.001]
@@ -47,7 +55,6 @@ uto_planner:
     horizon: 6.0
     lookahead_spacing: 0.60
     replan_rate: 0.75
-    path_timeout: 2.0
     path_tube_radius: 1.00
     sigma_path_tube_radius: 1.20
     weights: [1.0,10.0,10.0,0.007,1.0e-6,1.0e-6]
