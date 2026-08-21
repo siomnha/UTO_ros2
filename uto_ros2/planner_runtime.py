@@ -4,11 +4,13 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 import threading
+import queue
 import time
 from typing import Callable
 import numpy as np
 from .belief_adapter import reconstruct_belief_from_sigma, resample_sigma_states
 from .dynamics import rk4
+from .lgr import interpolate_control
 from .ifds_path_adapter import Polyline
 from .math_utils import euler_to_rot, so3_log
 from .trajectory import Trajectory, TrajectoryBuffer
@@ -59,6 +61,8 @@ class GateConfig:
     start_velocity_tolerance: float = 0.7
     minimum_horizon: float = 0.2
     residual_limit: float = 1e-4
+    dense_points_per_region: int = 15
+    rollout_endpoint_tolerance: float = 0.3
 
 
 @dataclass
@@ -69,6 +73,11 @@ class GateResult:
     max_path_error: float
     max_sigma_path_error: float
     max_lgr_dynamics_residual: float
+    max_dense_mean_path_error: float
+    max_dense_sigma_path_error: float
+    max_dense_velocity: float
+    max_dense_attitude: float
+    rollout_endpoint_error: float
 
 
 class FeasibilityGate:
@@ -150,6 +159,19 @@ class FeasibilityGate:
             reasons.append("mean path tube")
         if sigma_error > self.config.sigma_path_tube:
             reasons.append("sigma path tube")
+        dense = self._dense_rollout(result, request)
+        if dense[0] > self.config.path_tube:
+            reasons.append("dense mean path tube")
+        if dense[1] > self.config.sigma_path_tube:
+            reasons.append("dense sigma path tube")
+        if dense[2] > self.config.velocity_max + 1e-5:
+            reasons.append("dense velocity bound")
+        if dense[3] > self.config.angle_max + 1e-5:
+            reasons.append("dense attitude bound")
+        if dense[4] > self.config.rollout_endpoint_tolerance:
+            reasons.append("rollout endpoint consistency")
+        if dense[5]:
+            reasons.append("dense control bound")
         return GateResult(
             not reasons,
             reasons,
@@ -157,7 +179,44 @@ class FeasibilityGate:
             mean_error,
             sigma_error,
             residual,
+            *dense[:5],
         )
+
+    def _dense_rollout(self, result: dict, request: PlanningRequest) -> tuple:
+        controls = result.get("physical_control_blocks")
+        endpoints = result.get("region_endpoint_sigma_physical")
+        nodes = result.get("lgr_nodes")
+        regions = int(result.get("regions", 0))
+        horizon = float(result.get("horizon", 0.0))
+        if controls is None or endpoints is None or nodes is None or regions < 1 or horizon <= 0:
+            return (np.inf, np.inf, np.inf, np.inf, np.inf, True)
+        states = np.asarray(request.sigma_states, dtype=float).T.copy()
+        duration = horizon / regions
+        points = self.config.dense_points_per_region
+        metrics = [0.0] * 5
+        control_violation = False
+        for region in range(regions):
+            step = duration / points
+            queries = -1.0 + (np.arange(points) + 0.5) * 2.0 / points
+            dense_controls = interpolate_control(nodes, controls[region], queries)
+            for index in range(points):
+                control = dense_controls[:, index]
+                states = np.stack([rk4(state, control, step) for state in states])
+                if not np.all(np.isfinite(states)) or not np.all(np.isfinite(control)):
+                    return (np.inf, np.inf, np.inf, np.inf, np.inf, True)
+                control_violation |= bool(
+                    np.any(control < np.asarray(self.config.control_min) - 1e-5)
+                    or np.any(control > np.asarray(self.config.control_max) + 1e-5)
+                )
+                metrics[0] = max(metrics[0], request.path.project(states[:, :3].mean(axis=0))[2])
+                metrics[1] = max(metrics[1], max(request.path.project(p)[2] for p in states[:, :3]))
+                metrics[2] = max(metrics[2], float(np.max(np.abs(states[:, 3:6]))))
+                metrics[3] = max(metrics[3], float(np.max(np.abs(states[:, 6:8]))))
+            metrics[4] = max(
+                metrics[4],
+                float(np.max(np.linalg.norm(states - np.asarray(endpoints[region]), axis=1))),
+            )
+        return (*metrics, control_violation)
 
 
 class DelayPredictor:
@@ -220,6 +279,7 @@ class DelayPredictor:
                 axis=1,
             )
         mean, rotation, covariance = reconstruct_belief_from_sigma(propagated)
+        velocity_deviations = propagated[3:6] - mean[3:6, None]
         process = np.asarray(process_noise_diagonal, dtype=float)
         if process.shape == (9,):
             process = process[[0, 1, 2, 6, 7, 8]]
@@ -227,19 +287,29 @@ class DelayPredictor:
             raise ValueError("delay process noise must have 6 or 9 diagonal entries")
         covariance = covariance + np.diag(process) * duration
         resampled = resample_sigma_states(mean, rotation, covariance)
+        resampled[3:6] = mean[3:6, None] + velocity_deviations
+        # Floating point drift must not alter the propagated mean velocity.
+        resampled[3:6] -= resampled[3:6].mean(axis=1, keepdims=True) - mean[3:6, None]
         return resampled, mean, rotation, covariance
 
 
-class LatestWinsWorker:
-    """One solver-owner thread with at most one pending latest request."""
+@dataclass(frozen=True)
+class CompletionEvent:
+    request: object
+    result: object
+    stale: bool
 
-    def __init__(self, solve: Callable, complete: Callable) -> None:
+
+class LatestWinsWorker:
+    """Single solver-owner thread; ROS thread drains immutable completions."""
+
+    def __init__(self, solve: Callable, complete: Callable = None) -> None:
         self.solve = solve
-        self.complete = complete
         self.condition = threading.Condition()
         self.pending = None
         self.stopping = False
         self.solve_in_progress = False
+        self.completions = queue.SimpleQueue()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -270,7 +340,19 @@ class LatestWinsWorker:
             with self.condition:
                 self.solve_in_progress = False
                 stale = self.pending is not None
-            self.complete(request, result, stale)
+            self.completions.put(CompletionEvent(request, result, stale))
+
+    def drain_completions(self) -> list:
+        events = []
+        while True:
+            try:
+                events.append(self.completions.get_nowait())
+            except queue.Empty:
+                return events
+
+    def pending_count(self) -> int:
+        with self.condition:
+            return int(self.pending is not None)
 
     def shutdown(self, timeout: float = 5.0) -> bool:
         with self.condition:
@@ -318,6 +400,25 @@ class CandidateManager:
         return self.buffer.offer(trajectory), "accepted"
 
 
+def commit_due_status(now: float, candidate: Trajectory, allowed_lateness: float) -> tuple:
+    """Return waiting/due/late and signed commit lateness."""
+    lateness = now - candidate.commit_time
+    if lateness < 0.0:
+        return "waiting", lateness
+    if lateness > allowed_lateness:
+        return "late", lateness
+    return "due", lateness
+
+
+def update_goal_dwell(since, now: float, conditions: bool, active_remaining: float, dwell: float):
+    """Pure dwell transition helper used by the high-rate state timer."""
+    if active_remaining > 0.0 or not conditions:
+        return None, False
+    if since is None:
+        return now, False
+    return since, now - since >= dwell
+
+
 def commit_continuity_errors(candidate: Trajectory, belief) -> tuple:
     initial = candidate.states[0]
     position = float(np.linalg.norm(initial[:3] - belief.mean_state[:3]))
@@ -340,6 +441,19 @@ def can_resume(
         and velocity_fresh
         and path_fresh
     )
+
+
+def offboard_control_flags(level: str) -> dict:
+    """Return mutually exclusive PX4 OffboardControlMode fields."""
+    if level not in ("position", "velocity", "acceleration"):
+        raise ValueError("unsupported offboard control level")
+    return {
+        "position": level == "position",
+        "velocity": level == "velocity",
+        "acceleration": level == "acceleration",
+        "attitude": False,
+        "body_rate": False,
+    }
 
 
 class CommandState(Enum):
@@ -469,9 +583,13 @@ PLANNER_PARAMETER_DEFAULTS = {
     "lookahead_count": 10,
     "lookahead_spacing": 0.4,
     "replan_rate": 1.5,
+    "commit_check_rate": 50.0,
+    "allowed_commit_lateness": 0.04,
     "belief_timeout": 0.3,
     "path_timeout": 0.8,
     "velocity_timeout": 0.3,
+    "source_clock_tolerance": 0.5,
+    "px4_velocity_time_mode": "offset",
     "stable_samples": 5,
     "covariance_eigen_floor": 1e-9,
     "covariance_inflation": 1.2,
@@ -483,6 +601,8 @@ PLANNER_PARAMETER_DEFAULTS = {
     "lgr_nodes_per_region": 5,
     "sigma_count": 7,
     "control_check_points_per_region": 31,
+    "gate_dense_points_per_region": 15,
+    "gate_rollout_endpoint_tolerance": 0.3,
     "path_tube_radius": 0.8,
     "sigma_path_tube_radius": 1.0,
     "initial_delay": 0.5,
@@ -496,6 +616,9 @@ PLANNER_PARAMETER_DEFAULTS = {
     "commit_position_tolerance": 0.5,
     "commit_velocity_tolerance": 0.7,
     "commit_attitude_tolerance": 0.25,
+    "goal_position_tolerance": 0.2,
+    "goal_velocity_tolerance": 0.2,
+    "goal_dwell_time": 1.0,
     "terminal_position_tolerance": 0.3,
     "terminal_velocity_tolerance": 0.05,
     "process_noise_diagonal": [0.01, 0.01, 0.01, 0.02, 0.02, 0.02, 0.001, 0.001, 0.001],
@@ -574,6 +697,8 @@ def build_runtime_components(parameter: Callable[[str], object]) -> RuntimeCompo
             terminal_position_tolerance=parameter("terminal_position_tolerance"),
             path_tube=parameter("path_tube_radius"),
             sigma_path_tube=parameter("sigma_path_tube_radius"),
+            dense_points_per_region=parameter("gate_dense_points_per_region"),
+            rollout_endpoint_tolerance=parameter("gate_rollout_endpoint_tolerance"),
         )
     )
     return RuntimeComponents(nlp, adapter, delay, buffer, manager, gate)

@@ -336,6 +336,15 @@ class UTONLP:
             "max_lgr_dynamics_residual": maximum_residual,
             "normalized_state_blocks": normalized_blocks,
             "physical_control_blocks": physical_controls,
+            "region_endpoint_sigma_physical": [
+                np.stack(
+                    [self._sx * normalized_blocks[sigma][region][:, -1] for sigma in range(c.sigma)]
+                )
+                for region in range(c.regions)
+            ],
+            "lgr_nodes": self.tau.copy(),
+            "horizon": float(self.opti.value(self.p_h)),
+            "regions": c.regions,
         }
 
     def _calculate_residual(self, normalized_blocks, physical_controls, horizon):

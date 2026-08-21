@@ -39,6 +39,8 @@ class Trajectory:
         self.mean_covariances = np.asarray(self.mean_covariances, dtype=float)
         if self.mean_covariances.shape != (len(self.times), 9, 9):
             raise ValueError("covariances must have shape [samples,9,9]")
+        if not np.all(np.isfinite(self.mean_covariances)):
+            raise ValueError("trajectory covariance contains non-finite values")
 
     @property
     def commit_time(self) -> float:
@@ -55,6 +57,11 @@ class Trajectory:
         relative = float(np.clip(now - self.commit_time, self.times[0], self.times[-1]))
         state = np.array(
             [np.interp(relative, self.times, self.states[:, column]) for column in range(9)]
+        )
+        unwrapped_yaw = np.unwrap(self.states[:, 8])
+        state[8] = np.arctan2(
+            np.sin(np.interp(relative, self.times, unwrapped_yaw)),
+            np.cos(np.interp(relative, self.times, unwrapped_yaw)),
         )
         control_times = self.times[: len(self.controls)]
         control = np.array(

@@ -82,31 +82,43 @@ class StabilityConfig:
 
 
 class BeliefStableDetector:
+    """Consecutive stability test using SO(3) geodesic attitude change."""
+
     def __init__(self, cfg=StabilityConfig()):
         self.cfg = cfg
         self.count = 0
         self.last = None
 
-    def update(self, stamp, now, mean, cov, frame_ok=True, velocity_ok=True):
-        mean = np.asarray(mean)
-        cov = np.asarray(cov)
+    def invalidate(self):
+        self.count = 0
+        self.last = None
+
+    def update(self, stamp, now, position, rotation, cov, frame_ok=True, velocity_ok=True):
+        position = np.asarray(position, dtype=float)
+        rotation = np.asarray(rotation, dtype=float)
+        cov = np.asarray(cov, dtype=float)
         ok = (
-            now - stamp <= self.cfg.timeout
+            0.0 <= now - stamp <= self.cfg.timeout
             and frame_ok
             and velocity_ok
-            and np.all(np.isfinite(mean))
+            and np.all(np.isfinite(position))
+            and np.all(np.isfinite(rotation))
             and np.all(np.isfinite(cov))
             and np.trace(cov[:3, :3]) <= self.cfg.position_trace
             and np.trace(cov[3:, 3:]) <= self.cfg.attitude_trace
             and np.max(np.abs(cov)) > 0
         )
-        if self.last is not None:
-            ok &= (
-                np.linalg.norm(mean - self.last[0]) <= self.cfg.mean_delta
-                and np.linalg.norm(cov - self.last[1]) <= self.cfg.covariance_delta
+        if ok and self.last is not None:
+            position_delta = np.linalg.norm(position - self.last[0])
+            attitude_delta = np.linalg.norm(so3_log(self.last[1].T @ rotation))
+            covariance_delta = np.linalg.norm(cov - self.last[2])
+            ok = (
+                position_delta <= self.cfg.mean_delta
+                and attitude_delta <= self.cfg.mean_delta
+                and covariance_delta <= self.cfg.covariance_delta
             )
         self.count = self.count + 1 if ok else 0
-        self.last = (mean.copy(), cov.copy())
+        self.last = (position.copy(), rotation.copy(), cov.copy()) if ok else None
         return self.count >= self.cfg.samples
 
 
@@ -138,9 +150,7 @@ class BeliefAdapter:
         )
         states, _ = sigma_states(position, R, velocity, cov)
         mean = np.r_[position, velocity, rot_to_euler(R)]
-        stable = self.detector.update(
-            stamp, now, np.r_[position, rot_to_euler(R)], cov, frame_ok, velocity_ok
-        )
+        stable = self.detector.update(stamp, now, position, R, cov, frame_ok, velocity_ok)
         self.generation += 1
         return (
             Belief(

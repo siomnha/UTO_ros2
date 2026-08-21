@@ -1,10 +1,4 @@
-"""Target-workspace ROS integration smoke test.
-
-This test is intentionally skipped outside a sourced ROS/PX4/CasADi workspace. In the
-integration image it verifies that the package's required runtime imports and node
-constructors are available before the full launch fixture publishes fake PX4,
-odometry and Path messages.
-"""
+"""ROS/PX4 workspace construction smoke test; skipped when dependencies are absent."""
 
 import importlib.util
 import pytest
@@ -16,9 +10,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_ros_nodes_are_constructible_in_integration_workspace():
+def test_ros_nodes_construct_and_expose_independent_timers():
+    import rclpy
     from uto_ros2.px4_offboard_bridge_node import PX4OffboardBridge
     from uto_ros2.uto_planner_node import UTOPlannerNode
 
-    assert PX4OffboardBridge is not None
-    assert UTOPlannerNode is not None
+    rclpy.init()
+    planner = bridge = None
+    try:
+        planner = UTOPlannerNode()
+        bridge = PX4OffboardBridge()
+        assert planner.planning_timer is not planner.commit_timer
+        assert planner.get_parameter("commit_check_rate").value == 50.0
+        assert bridge.get_parameter("setpoint_rate").value == 40.0
+        assert bridge.get_parameter("offboard_control_level").value == "position"
+    finally:
+        if planner is not None:
+            planner.destroy_node()
+        if bridge is not None:
+            bridge.destroy_node()
+        rclpy.shutdown()

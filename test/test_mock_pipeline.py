@@ -4,6 +4,7 @@ import numpy as np
 from types import SimpleNamespace
 from uto_ros2.belief_adapter import sigma_states
 from uto_ros2.ifds_path_adapter import Polyline
+from uto_ros2.lgr import lgr_operators
 from uto_ros2.planner_runtime import (
     CandidateManager,
     FeasibilityGate,
@@ -34,6 +35,7 @@ def test_first_solve_commit_replan_and_stale_discard():
     states = np.zeros((2, 9))
     states[:, 2] = 1
     states[1, 0] = 1
+    tau, _ = lgr_operators(5)
     result = {
         "times": np.array([0.0, 1.0]),
         "states_physical": states,
@@ -42,6 +44,11 @@ def test_first_solve_commit_replan_and_stale_discard():
         "mean_covariances": np.zeros((2, 9, 9)),
         "stats": {"success": True},
         "max_lgr_dynamics_residual": 0.0,
+        "physical_control_blocks": [np.repeat(np.array([[9.81], [0], [0], [0.0]]), 5, axis=1)],
+        "region_endpoint_sigma_physical": [np.repeat(states[:1], 7, axis=0)],
+        "lgr_nodes": tau,
+        "horizon": 1.0,
+        "regions": 1,
     }
     gate = FeasibilityGate(GateConfig(terminal_position_tolerance=0.1)).check(result, request, 1)
     buffer = TrajectoryBuffer()

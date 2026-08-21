@@ -25,6 +25,8 @@ def so3_log(R):
 def quat_to_rot(q):
     x, y, z, w = np.asarray(q, float)
     n = np.linalg.norm([x, y, z, w])
+    if not np.isfinite(n) or n < 1e-12:
+        raise ValueError("invalid quaternion")
     x, y, z, w = np.array([x, y, z, w]) / n
     return np.array(
         [

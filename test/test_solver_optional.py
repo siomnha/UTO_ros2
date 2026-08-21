@@ -70,3 +70,42 @@ def test_extracted_lgr_residual_detects_tampered_state():
     original = nlp.compute_residual(result)
     result["normalized_state_blocks"][0][0][0, 0] += 0.1
     assert nlp.compute_residual(result) > original + 1e-4
+
+
+def test_default_2x5x7_graph_reuses_solver_and_reports_timing():
+    config = UTOConfig(max_iter=200, terminal_position_tolerance=0.5)
+    nlp = UTONLP(config).build()
+    covariance = np.diag([1e-4] * 6)
+    initial, _ = sigma_states([0, 0, 1], np.eye(3), [0, 0, 0], covariance)
+    references = np.repeat(np.array([[0.0, 0.0, 1.0]]), 10, axis=0)
+    nlp.set_parameters(
+        initial,
+        references,
+        1.0,
+        [0, 0, 0],
+        [-1] * 3,
+        [1] * 3,
+        1,
+        [1, 1, 1, 0.01, 1e-6, 1e-6],
+    )
+    first = nlp.solve()
+    first_time = nlp.solve_time
+    nlp.set_parameters(
+        initial,
+        references,
+        1.1,
+        [0, 0, 0],
+        [-1] * 3,
+        [1] * 3,
+        1,
+        [1, 1, 1, 0.01, 1e-6, 1e-6],
+    )
+    second = nlp.solve()
+    assert nlp.build_count == 1
+    assert first["states_physical"].shape == (11, 9)
+    assert first["max_lgr_dynamics_residual"] < 1e-4
+    assert np.all(np.isfinite(first["terminal_covariance"]))
+    assert np.linalg.eigvalsh(first["terminal_covariance"]).min() > -1e-8
+    assert nlp.build_time > 0 and first_time > 0 and nlp.solve_time > 0
+    assert first["iterations"] >= 0 and second["iterations"] >= 0
+    print({"build": nlp.build_time, "first_solve": first_time, "second_solve": nlp.solve_time})

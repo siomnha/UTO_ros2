@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from uto_ros2.belief_adapter import (
+    BeliefStableDetector,
+    StabilityConfig,
     reconstruct_belief_from_sigma,
     sanitize_covariance,
     sigma_states,
@@ -33,6 +35,9 @@ from uto_ros2.planner_runtime import (
     Px4CommandSequencer,
     can_resume,
     commit_continuity_errors,
+    commit_due_status,
+    offboard_control_flags,
+    update_goal_dwell,
 )
 from uto_ros2.trajectory import Trajectory, TrajectoryExecution
 
@@ -124,6 +129,8 @@ def make_gate_result(residual=0.0):
     states = np.zeros((2, 9))
     states[:, 2] = 1.0
     states[1, 0] = 1.0
+    tau, _ = lgr_operators(5)
+    endpoints = np.repeat(states[:1], 7, axis=0)
     return {
         "times": np.array([0.0, 0.5]),
         "states_physical": states,
@@ -132,6 +139,11 @@ def make_gate_result(residual=0.0):
         "mean_covariances": np.zeros((2, 9, 9)),
         "stats": {"success": True},
         "max_lgr_dynamics_residual": residual,
+        "physical_control_blocks": [np.repeat(np.array([[9.81], [0], [0], [0.0]]), 5, axis=1)],
+        "region_endpoint_sigma_physical": [endpoints],
+        "lgr_nodes": tau,
+        "horizon": 0.5,
+        "regions": 1,
     }
 
 
@@ -143,7 +155,7 @@ def test_gate_rejects_real_lgr_residual():
         1,
         0,
         1,
-        np.zeros((9, 7)),
+        np.repeat(np.array([[0, 0, 1, 0, 0, 0, 0, 0, 0]]).T, 7, axis=1),
         np.array([0, 0, 1, 0, 0, 0, 0, 0, 0]),
         np.eye(3),
         np.eye(6),
@@ -201,16 +213,13 @@ def test_velocity_yaw_alignment():
 
 
 def test_first_request_cannot_be_replaced_and_worker_shutdown():
-    completed = []
-    worker = LatestWinsWorker(
-        lambda request: (time.sleep(0.05), request)[1],
-        lambda request, result, stale: completed.append((result, stale)),
-    )
+    worker = LatestWinsWorker(lambda request: (time.sleep(0.05), request)[1])
     assert worker.submit("first", replace_pending=False)
     time.sleep(0.01)
     assert not worker.submit("duplicate-first", replace_pending=False)
     time.sleep(0.08)
-    assert completed == [("first", False)]
+    events = worker.drain_completions()
+    assert len(events) == 1 and events[0].result == "first" and not events[0].stale
     assert worker.shutdown()
 
 
@@ -236,3 +245,140 @@ def test_bridge_execution_policy_returns_exactly_one_output_each_cycle():
     outputs = [execution.select(now, False, False) for now in (0.0, 0.025, 0.05)]
     assert len(outputs) == 3
     assert all(output.mode == "TAKEOFF_HOLD" for output in outputs)
+
+
+def test_delay_preserves_propagated_velocity_dispersion():
+    covariance = np.diag([1e-8, 1e-8, 1e-8, 0.04, 0.04, 0.04])
+    sigma, _ = sigma_states([0, 0, 1], np.eye(3), [0, 0, 0], covariance)
+    assert np.max(np.ptp(sigma[3:6], axis=1)) == 0
+    predictor = DelayPredictor(0.5, 20, 0.1, 2.0, 0.0, 0.0)
+    propagated, mean, _, _ = predictor.propagate(
+        sigma, 1.0, 1.5, lambda _: np.array([9.81, 0, 0, 0]), np.ones(9) * 0.01
+    )
+    assert np.max(np.ptp(propagated[3:6], axis=1)) > 1e-5
+    assert np.allclose(propagated[3:6].mean(axis=1), mean[3:6])
+
+
+def test_belief_stability_uses_so3_yaw_wrap():
+    detector = BeliefStableDetector(StabilityConfig(samples=2, mean_delta=np.deg2rad(5)))
+    covariance = np.eye(6) * 0.001
+    assert not detector.update(
+        0.0, 0.0, np.zeros(3), euler_to_rot([0, 0, np.deg2rad(179)]), covariance
+    )
+    assert detector.update(
+        0.01, 0.01, np.zeros(3), euler_to_rot([0, 0, np.deg2rad(-179)]), covariance
+    )
+
+
+def test_commit_frequency_lateness_and_goal_helpers():
+    trajectory = make_trajectory(commit=10.0)
+    assert commit_due_status(9.99, trajectory, 0.04)[0] == "waiting"
+    assert commit_due_status(10.02, trajectory, 0.04)[0] == "due"
+    assert commit_due_status(10.05, trajectory, 0.04)[0] == "late"
+    since, reached = update_goal_dwell(None, 10.0, True, 0.0, 1.0)
+    assert not reached
+    _, reached = update_goal_dwell(since, 11.01, True, 0.0, 1.0)
+    assert reached
+
+
+def test_offboard_control_levels_are_mutually_exclusive():
+    assert offboard_control_flags("position") == {
+        "position": True,
+        "velocity": False,
+        "acceleration": False,
+        "attitude": False,
+        "body_rate": False,
+    }
+    assert offboard_control_flags("velocity")["velocity"]
+    assert offboard_control_flags("acceleration")["acceleration"]
+    with pytest.raises(ValueError):
+        offboard_control_flags("attitude")
+
+
+def test_trajectory_yaw_interpolation_uses_short_wrapped_path():
+    trajectory = make_trajectory(commit=0.0)
+    trajectory.states[0, 8] = np.deg2rad(179)
+    trajectory.states[1, 8] = np.deg2rad(-179)
+    yaw = trajectory.sample(0.5)[0][8]
+    assert abs(abs(yaw) - np.pi) < np.deg2rad(2)
+
+
+def test_dense_rollout_rejects_endpoint_mismatch():
+    path = Polyline([[0, 0, 1], [1, 0, 1]])
+    sigma = np.repeat(np.array([[0, 0, 1, 0, 0, 0, 0, 0, 0]]).T, 7, axis=1)
+    request = PlanningRequest(
+        1,
+        "path",
+        1,
+        0,
+        1,
+        sigma,
+        sigma.mean(axis=1),
+        np.eye(3),
+        np.eye(6),
+        path.lookahead([0, 0, 1], 10, 0.2),
+        path,
+    )
+    result = make_gate_result(0.0)
+    result["region_endpoint_sigma_physical"][0][:, 0] += 2.0
+    checked = FeasibilityGate(GateConfig(terminal_position_tolerance=0.1)).check(result, request, 1)
+    assert not checked.accepted
+    assert "rollout endpoint consistency" in checked.reasons
+
+
+def test_rejected_new_path_candidate_does_not_replace_active_generation():
+    from uto_ros2.trajectory import TrajectoryBuffer
+
+    buffer = TrajectoryBuffer()
+    old = make_trajectory(generation=1, commit=0.0)
+    old.path_generation = "old-path"
+    buffer.offer(old)
+    buffer.commit_candidate()
+    new = make_trajectory(generation=2, commit=1.0)
+    new.path_generation = "new-path"
+    buffer.offer(new)
+    buffer.discard_candidate()
+    assert buffer.active.path_generation == "old-path"
+
+
+def test_runtime_defaults_separate_planning_and_commit_rates():
+    from uto_ros2.planner_runtime import PLANNER_PARAMETER_DEFAULTS
+
+    assert PLANNER_PARAMETER_DEFAULTS["replan_rate"] == 1.5
+    assert PLANNER_PARAMETER_DEFAULTS["commit_check_rate"] == 50.0
+
+
+def test_legacy_runtime_modules_are_absent():
+    from pathlib import Path
+
+    legacy = tuple(
+        "_".join(parts) + ".py"
+        for parts in (
+            ("async", "worker"),
+            ("delay", "compensator"),
+            ("feasibility", "gate"),
+            ("state", "machine"),
+            ("trajectory", "buffer"),
+            ("planner", "core"),
+        )
+    )
+    assert not any((Path("uto_ros2") / name).exists() for name in legacy)
+
+
+def test_commit_timer_source_never_calls_solver():
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("uto_ros2/uto_planner_node.py").read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_on_commit_timer"
+    )
+    called = {
+        node.func.attr
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "solve" not in called and "_solve_request" not in called

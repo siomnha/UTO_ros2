@@ -1,138 +1,88 @@
 # UTO ROS 2：FAST-LIO2 → IFDS → LGR UTO → PX4
 
-本包把 FAST-LIO2 position/attitude belief 和 IFDS path 转为延迟补偿的 2×5 LGR、7-sigma Unscented Trajectory Optimization，并由独立 PX4 bridge 执行。
+本仓库只有一套运行主链路：`uto_planner_node.py` 使用 `planner_runtime.py` 和 `trajectory.py`，PX4 bridge复用相同runtime/trajectory定义。MATLAB文件和论文保留为数值参考。
 
-> **当前 UTO 没有 obstacle constraints。IFDS path tracking 和 path-tube admission gate 不等价于 collision guarantee。避障仍依赖 IFDS 持续提供无碰路径和 PX4 安全机制。**
+> **当前UTO没有obstacle constraints。IFDS path tracking和path-tube validation不等价于collision guarantee。** IFDS必须负责持续生成无碰path，PX4 bridge是唯一低层setpoint publisher。
 
-## 目录和职责
+## 真实目录
 
 ```text
 uto_ros2/
-├── math_utils.py              # SO(3), quaternion, ENU/NED, velocity yaw alignment
-├── dynamics.py                # physical quadrotor dynamics and RK4
-├── lgr.py                     # nodes, D, quadrature, interpolation, dense checks
-├── belief_adapter.py          # covariance sanitation, SO(3) sigma/UT, stable detector
-├── ifds_path_adapter.py       # Polyline projection/lookahead/hash
-├── uto_nlp.py                 # one reusable fixed CasADi/IPOPT LGR graph
-├── trajectory.py              # physical JSON trajectory, interpolation, buffer, hold policy
-├── planner_runtime.py         # state/request/P90/delay/gate/worker/command sequencer
-├── uto_planner_node.py        # ROS inputs → request → solve → gate → commit → publish
-└── px4_offboard_bridge_node.py# PX4 status/ACK → one setpoint/timer
+├── math_utils.py                 # SO(3), quaternion, ENU/NED
+├── dynamics.py                   # physical dynamics + RK4
+├── lgr.py                        # LGR nodes/D/quadrature/interpolation
+├── belief_adapter.py             # FAST-LIO covariance, sigma, SO(3) stability
+├── ifds_path_adapter.py          # polyline/project/lookahead/hash
+├── uto_nlp.py                    # fixed reusable CasADi/IPOPT LGR graph
+├── trajectory.py                 # sole trajectory/schema/interpolation/buffer implementation
+├── planner_runtime.py            # sole state/request/delay/gate/worker runtime
+├── uto_planner_node.py           # ROS planner node
+└── px4_offboard_bridge_node.py   # ROS PX4 bridge node
 ```
 
-旧的 `async_worker.py`、`state_machine.py`、`planner_core.py`、`delay_compensator.py`、`feasibility_gate.py` 和 `trajectory_buffer.py` 已合并并删除；运行时只有两个有明确边界的核心模块。
+旧的`async_worker.py`、`delay_compensator.py`、`feasibility_gate.py`、`state_machine.py`、`trajectory_buffer.py`和`planner_core.py`已删除且无残余import。系统只有两个ROS nodes；“10个LGR collocation nodes”是2 regions × 5 nodes，“7 sigma trajectories”是同一NLP中的不确定轨迹，不是ROS nodes。
 
-## Planner 闭环
+## Planner双timer和线程模型
+
+* **Planning timer**：使用`replan_rate`（global 0.75 Hz，online 1.5 Hz），只决定是否replan、生成delay-compensated request和提交latest-wins worker。
+* **Commit/safety timer**：默认`commit_check_rate=50 Hz`，消费worker completion queue、推进mission state、执行freshness/goal检查、gate admission、candidate due/continuity/late检查、atomic commit和轻量diagnostics。它不调用NLP build/solve。
+
+Worker线程是唯一CasADi/IPOPT owner，只set parameters、solve、extract并把immutable `CompletionEvent`放入线程安全queue。所有state、candidate、publisher更新都在ROS timer线程完成。First solve使用不可替换提交，避免cold solve期间重复first request；普通solve仍为latest-wins，stale completion只丢弃。
+
+Candidate允许的commit lateness由`allowed_commit_lateness`限制；超过阈值会拒绝，避免从trajectory中间开始。通过gate的candidate只留在planner本地，到commit时用最新belief检查position、velocity和SO(3) geodesic attitude error，成功后才发布给bridge。Global mode的active path generation也只在成功commit后更新。
+
+## Belief、delay和时间域
+
+FAST-LIO `/Odometry`读取position、quaternion、ROS timestamp和完整6×6 position/attitude-tangent covariance，保留cross terms并执行finite、all-zero、PSD、eigen-floor和inflation检查。Stable detector使用position Euclidean变化、`Log(R_previousᵀR_current)` attitude变化及covariance变化，所以`179°→-179°`不会被误判为358°跳变。Conversion、frame、quaternion、covariance或velocity失败会立即清除stable状态。
+
+Delay从belief timestamp开始，以相同绝对时钟查询active controls并用RK4传播七条sigma trajectories。SO(3) UT后只向6D position/attitude tangent covariance加入`Q_delay Δt`；重新注入该spread时保留动力学传播产生的每条sigma velocity deviation，并保持mean velocity不变。`commit_time < belief_stamp`或clock非finite会拒绝request。
+
+PX4 `VehicleOdometry.timestamp_sample`存在时优先使用，否则使用`timestamp`。`px4_velocity_time_mode=offset`显式估计PX4→ROS offset并监测offset跳变；`ros`模式要求timestamp已在ROS `/clock`域。超过`source_clock_tolerance`的变化使velocity invalid。Diagnostics发布belief/path/velocity age和velocity clock offset。IFDS path的header stamp必须非零，且每次有效dynamic update必须更新ROS timestamp。
+
+Velocity先NED→ENU，再按`velocity_frame_alignment_mode=identity|yaw_offset`映射到planning map；本包未声称支持TF velocity alignment。
+
+## LGR UTO和dense gate
+
+默认固定graph为2 regions × 5 LGR nodes、7 shared-control sigma trajectories、10 references。NLP包含normalized LGR dynamics、region continuity、dense polynomial control bounds、velocity/attitude bounds、path tracking、terminal mean/covariance/velocity、effort和smoothness。Startup-only参数包括regions、nodes、sigma、references、control checks和scales；在线只`set_value`，`build_count`保持1。
+
+Admission先检查真实LGR residual和collocation output，再独立执行每region默认15点RK4 rollout：用优化后的LGR control polynomial做barycentric interpolation，从七条commit sigma initial states传播，检查finite、dense mean/all-sigma path tube、velocity、roll/pitch、control bounds以及rollout/LGR endpoint consistency。Diagnostics发布所有dense maxima和endpoint error。Dense path tube仍不是collision checking。
+
+## GOAL_REACHED和hold
+
+IFDS polyline终点是当前goal。Active trajectory结束后，最新belief必须连续`goal_dwell_time`满足position和velocity tolerance才进入`GOAL_REACHED`；否则trajectory过期进入`SAFE_HOLD`，不能误报goal。Goal reached后停止普通replanning并保持bridge terminal hold；开始新mission采用保守规则：重启planner/mission或显式重新启动流程，不因新path自动离开goal。
+
+Trajectory JSON (`uto_trajectory/v1`)验证time/state/control/covariance shape、finite和monotonic。Yaw插值先unwrap再wrap，避免`+π/-π`走长路径。正常结束hold最终trajectory position/yaw；emergency hold保持最后实际安全setpoint，不回起飞点，不外推过期trajectory。
+
+## PX4 bridge
+
+Bridge独立40 Hz运行，solver不会阻塞。每个非failsafe周期发布一个heartbeat和恰好一个`TrajectorySetpoint`。默认`offboard_control_level=position`，对应：
 
 ```text
-Odometry + configured velocity
-  → full 6×6 position/SO(3)-tangent covariance sanitize
-  → seven R_mean Exp(delta_theta) simplex states
-  → consecutive stable detector
-IFDS Path → frame/freshness/hash → fixed arc-length references
-active control history + belief timestamp
-  → RK4 to commit time → SO(3) UT → P + Q_delay Δt
-  → regenerate seven SO(3) sigma states
-  → one background reusable LGR solve
-  → real LGR residual + feasibility gate
-  → local pending candidate
-  → at commit compare latest actual belief
-  → publish to PX4 bridge only after continuity acceptance
+position=true, velocity=false, acceleration=false,
+attitude=false, body_rate=false
 ```
 
-`uto_planner_node.py` 的 timer 只取得 snapshot、推进 mission state、执行到期 commit、按需创建 request 和发布 diagnostics。ROS callbacks 不调用 IPOPT。`LatestWinsWorker` 是唯一 solver owner。
+也支持`velocity`或`acceleration`互斥层级。即使position是控制层级，TrajectorySetpoint仍填写velocity/acceleration feed-forward。ENU yaw rate转NED使用`yawspeed_ned=-yaw_rate_enu`，不再固定NaN。不同PX4版本对OffboardControlMode优先级、topic suffix和message fields可能不同，必须在目标`px4_msgs` checkout核对。
 
-### First solve 和 online replanning
+Bridge订阅参数化`VehicleCommandAck`，以`WAIT_CONNECTION→PRESTREAM→REQUEST_OFFBOARD→REQUEST_ARM→TAKEOFF_HOLD→READY`顺序运行，带retry interval、ACK timeout和max retries；拒绝或超限进入FAULT。`auto_arm_takeoff=false`不主动发arm/offboard。PX4 failsafe时planner不覆盖PX4自己的failsafe setpoint。
 
-状态为：
+## IFDS contract和ROS interfaces
 
-`WAIT_PX4 → TAKEOFF → HOLD → WAIT_BELIEF_STABLE → WAIT_IFDS_INITIAL_PATH → BUILDING_NLP → FIRST_SOLVE → TRAJECTORY_READY → EXECUTING ↔ REPLANNING`，并有 `GOAL_REACHED`、`SAFE_HOLD`、`FAULT`。
-
-`first_request_submitted` 和 `solve_in_progress` 防止 0.9 s cold build/solve 期间重复 first request。新 belief/path 仍更新 latest snapshot，但 first result 完成前不提交普通 replanning。正常 online solve 使用 latest-wins；stale result只丢弃，不导致 hold。
-
-### Delay 和 process noise
-
-控制查询严格使用：
-
-```python
-control_at(belief_stamp + relative_time)
-```
-
-若 clock 非 finite 或 `commit_time < belief_stamp`，request 被拒绝。传播后的 position/attitude tangent covariance显式加入 `Q_delay × Δt`，再围绕 SO(3) mean重新生成七个 sigma states，所以 process noise真正进入 NLP initial parameters。姿态 mean/covariance用 SO(3) Log/Exp，不对 Euler angles 做线性平均。
-
-### Commit-time continuity
-
-Solve/gate 成功后 trajectory 只进入 planner local candidate buffer，不立即发布。到 commit time 读取最新 belief，检查 position、velocity 和 SO(3) geodesic attitude error。全部低于 YAML tolerance 才原子 commit并发布；否则丢弃并立即允许重规划。有 active safe tail 时继续执行，否则进入 `SAFE_HOLD`。
-
-`/uto/resume` 使用 `std_srvs/Trigger`。只有 PX4 connected、无 failsafe、hold ready、belief重新稳定、velocity fresh、path fresh时才允许从 `SAFE_HOLD` 恢复。`FAULT` 不能通过普通 resume 恢复。
-
-## LGR UTO
-
-默认固定结构：2 regions、5 LGR nodes/region、7 sigma trajectories、10 references。每个 sigma/region 使用 `X Dᵀ = Δt/2 Sx⁻¹ f(SxX,SuU)`；region state连续，所有 sigma共享 controls，control endpoint插值连续。
-
-目标包含 mean path tracking、terminal mean position、terminal position covariance trace、terminal velocity、effort和smoothness。约束包含 velocity、roll/pitch、terminal mean position/velocity及control bounds。
-
-Control bounds不再只检查五个nodes。每region使用 LGR nodes、endpoint、相邻midpoints及默认31个dense points的并集：`U_check = U_nodes × interpolation_matrix`。NLP extraction用实际 normalized state blocks、physical control blocks、D和dynamics重新计算 `max_lgr_dynamics_residual`；gate不再接受默认零 residual。
-
-`regions`、`lgr_nodes_per_region`、`sigma_count`、`lookahead_count`、`control_check_points_per_region`、state/control dimensions和scales均为 **startup-only**。在线只更新 initial sigma、references、horizon、mode、weights和terminal bounds；`build_count`应始终为1。
-
-## FAST-LIO2、velocity和IFDS contract
-
-`/Odometry` 使用 position、quaternion、timestamp、frame和完整ROS pose covariance `[xyz, rotation-about-xyz]`，保留cross blocks。Covariance会finite/symmetry/all-zero/PSD/eigen-floor/inflation检查。
-
-Velocity source：
-
-* `patched_odometry_twist`；
-* `px4_vehicle_odometry`；
-* `separate_velocity_topic` (`TwistStamped`)。
-
-PX4 velocity先NED→ENU，再根据 `velocity_frame_alignment_mode` 使用 `identity` 或 `yaw_offset`。未知alignment mode会拒绝velocity/belief并保持hold。本包没有声称已实现TF velocity alignment。
-
-IFDS必须为 **path-only**：IFDS只发布 `/ifds/local_path`，UTO是唯一local trajectory generator，PX4 bridge是唯一setpoint publisher。禁止IFDS/MAVROS同时直接控制PX4。Path frame必须已与planning frame一致；当前不在planner内做TF转换。Generation由header timestamp和content hash组成，lookahead从predicted commit position开始并固定尺寸padding。
-
-## Trajectory和PX4 bridge
-
-`/uto/trajectory` 是验证过的 `uto_trajectory/v1` JSON：包含generation、path generation、frame、commit nanoseconds、physical `[N,9]` states、physical controls、times和covariances。Bridge只接收已经通过commit-time实际belief检查的可执行trajectory。
-
-Bridge每个非failsafe timer严格执行：heartbeat → command sequencer →选择一个takeoff/trajectory/terminal/emergency hold setpoint →发布**一个** `TrajectorySetpoint` →status。PX4 failsafe时不发布规划器setpoint覆盖PX4自身failsafe。
-
-Hold策略：
-
-* 起飞前使用takeoff hold；
-* 正常trajectory结束hold trajectory最终position/yaw；
-* 暂时不能继续执行时hold最后安全setpoint；
-* 不外推过期trajectory；
-* 绝不自动飞回 `[0,0,hold_altitude]`。
-
-Command sequencer状态为 `WAIT_CONNECTION → PRESTREAM → REQUEST_OFFBOARD → REQUEST_ARM → TAKEOFF_HOLD → READY`，另有 `FAULT`。它订阅参数化的 `VehicleCommandAck` topic，按retry interval/ACK timeout/max retries受控重发；拒绝或超限进入FAULT。`auto_arm_takeoff=false`时不发送arm/offboard command，只等待外部完成。
-
-所有PX4 topics均参数化，因为不同PX4/px4_msgs checkout的`_v1` suffix可能不同。必须用目标workspace的`ros2 topic list/type`核对。
-
-## ROS interfaces
+IFDS必须为path-only，关闭IFDS/MAVROS direct setpoint。IFDS和UTO必须使用同一planning frame；当前frame mismatch会拒绝，不在planner内静默TF转换。
 
 | Interface | 默认值 |
 |---|---|
-| FAST-LIO belief | `/Odometry` (`nav_msgs/Odometry`) |
-| IFDS path | `/ifds/local_path` (`nav_msgs/Path`) |
-| Executable trajectory | `/uto/trajectory` (`std_msgs/String`) |
-| Planner diagnostics | `/uto/diagnostics` |
-| PX4/bridge state | `/uto/px4_status` |
-| Resume service | `/uto/resume` (`std_srvs/Trigger`) |
-| PX4 heartbeat/setpoint/command | `/fmu/in/offboard_control_mode`, `/trajectory_setpoint`, `/vehicle_command` |
-| PX4 status/local/ACK | YAML参数，默认`vehicle_status_v1`, `vehicle_local_position_v1`, `vehicle_command_ack` |
+| FAST-LIO belief | `/Odometry` |
+| IFDS path | `/ifds/local_path` |
+| Executable trajectory | `/uto/trajectory` |
+| Emergency execution command | `/uto/execution_command` |
+| Diagnostics / PX4 state | `/uto/diagnostics`, `/uto/px4_status` |
+| Resume | `/uto/resume` (`std_srvs/Trigger`) |
+| PX4 topics | 全部在`gazebo_harmonic_px4.yaml`参数化 |
 
-Diagnostics包括cold build、parameter update、solve/P90、extraction、gate time/status/reasons、真实LGR residual、commit delay、deadline/stale counters、build count、first-request/solve flags和active remaining。Bridge status包括command state/retries/fault、arming/offboard/failsafe、jitter、setpoint count和remaining time。
+`SAFE_HOLD`只有PX4 connected/no-failsafe/hold-ready、belief重新稳定、velocity/path fresh时才能通过resume；FAULT不能普通resume。
 
-## Global / online
-
-```bash
-ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=global
-ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online
-```
-
-Launch会实际选择对应YAML。Global使用6 s horizon/0.75 Hz并跳过未变化path上的不必要solve；online使用3 s/1.5 Hz并合并pending updates。两个mode复用同一固定graph结构。
-
-## Build、启动和检查
+## Build和运行
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -144,16 +94,9 @@ source install/setup.bash
 ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online
 ```
 
-启动顺序：Gazebo Harmonic/PX4 SITL → Micro XRCE-DDS → sensors/FAST-LIO2 → IFDS path-only → UTO → IFDS goal。
+启动顺序：Gazebo Harmonic/PX4 SITL → Micro XRCE-DDS → sensors/FAST-LIO2 → IFDS path-only → UTO → IFDS goal。确保ROS `/clock`、FAST-LIO/IFDS header stamps和PX4 timestamp offset稳定。
 
-```bash
-ros2 topic hz /fmu/in/trajectory_setpoint
-ros2 topic echo /uto/px4_status
-ros2 topic echo /uto/diagnostics
-ros2 service call /uto/resume std_srvs/srv/Trigger '{}'
-```
-
-## Tests和验证状态
+## Tests和当前验证状态
 
 ```bash
 python3 -m pytest -q test/test_core.py test/test_mock_pipeline.py
@@ -162,8 +105,10 @@ python3 -m pytest -q test/test_ros_integration_optional.py
 colcon test --packages-select uto_ros2 && colcon test-result --verbose
 ```
 
-Pure tests覆盖SO(3) UT、delay absolute control time、process-noise resampling、commit mismatch、dense control overshoot、real residual admission、terminal hold、ACK retry、resume、velocity yaw alignment、first request单提交和YAML duplicate keys。`test_mock_pipeline.py`是ROS-independent的first solve/candidate/commit/replan模型测试。`test_ros_integration_optional.py`当前只是目标ROS/PX4/CasADi workspace的节点import/constructibility smoke入口，**不是Gazebo测试，也不声称已经验证topic频率闭环**；目标CI仍应扩展fake publishers和launch fixture。
+Pure tests覆盖SO(3)、yaw wrap、delay velocity dispersion/process noise、dense rollout、dual-rate commit helpers、completion queue、goal dwell、global commit generation、trajectory interpolation、PX4 control levels和旧模块检查。Solver test包含小型1×2×7和默认2×5×7的build/two-solve/reuse/residual/covariance/timing检查。
+
+ROS optional test在依赖齐全时实际初始化rclpy并构造planner/bridge，检查独立planning/commit timers和默认PX4层级；它仍不是完整fake-topic状态序列或Gazebo验证。若目标CI需要完整消息闭环，应继续加入匹配该PX4版本的fake publishers/ACK fixture。当前README不声称Gazebo、PX4 SITL或未执行tests已经通过。
 
 ## Real-flight前
 
-必须在目标PX4/px4_msgs版本完成colcon build、小规模IPOPT solve、ROS fake-topic integration和Gazebo SITL fault injection；核对ACK result/constants/topics、timesync和frame alignment；定量对照MATLAB LGR mission；测试belief/path/velocity/DDS/PX4 loss和late solve；保留`auto_arm_takeoff=false`；配置geofence、RC takeover、kill switch并独立审查vehicle bounds及gate thresholds。
+必须在目标ROS/PX4 workspace通过pure tests、默认CasADi solve、colcon build/test和完整fake-topic integration，再运行Gazebo/PX4 SITL fault injection并记录40 Hz setpoint、cold/first/steady timing。核对PX4 ACK result、topic、timesync、frame alignment和OffboardControlMode优先级；定量对照MATLAB；测试belief/path/velocity/DDS/PX4 loss及late candidate；保持real vehicle `auto_arm_takeoff=false`，配置geofence、RC takeover、kill switch并独立审查bounds、dense gate和commit thresholds。

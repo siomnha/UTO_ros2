@@ -23,6 +23,8 @@ from .planner_runtime import (
     build_runtime_components,
     can_resume,
     commit_continuity_errors,
+    commit_due_status,
+    update_goal_dwell,
 )
 
 
@@ -49,12 +51,16 @@ class UTOPlannerNode(Node):
         self.path = None
         self.velocity = None
         self.velocity_stamp = 0.0
+        self.velocity_clock_offset = None
         self.px4 = {"connected": False, "hold_ready": False, "failsafe": False}
         self.request_generation = 0
         self.last_path_generation = ""
         self.first_request_submitted = False
         self.solve_in_progress = False
         self.last_gate = None
+        self.last_commit_lateness = 0.0
+        self.last_commit_errors = None
+        self.goal_since = None
         self._build_components()
         self._create_interfaces()
 
@@ -73,7 +79,7 @@ class UTOPlannerNode(Node):
         self.buffer = components.buffer
         self.manager = components.manager
         self.gate = components.gate
-        self.worker = LatestWinsWorker(self._solve_request, self._on_solve_complete)
+        self.worker = LatestWinsWorker(self._solve_request)
 
     def _create_interfaces(self) -> None:
         self.trajectory_pub = self.create_publisher(String, self._parameter("trajectory_topic"), 10)
@@ -100,7 +106,12 @@ class UTOPlannerNode(Node):
                 rclpy.qos.qos_profile_sensor_data,
             )
         self.create_service(Trigger, self._parameter("resume_service"), self._on_resume)
-        self.timer = self.create_timer(1.0 / self._parameter("replan_rate"), self._on_timer)
+        self.planning_timer = self.create_timer(
+            1.0 / self._parameter("replan_rate"), self._on_planning_timer
+        )
+        self.commit_timer = self.create_timer(
+            1.0 / self._parameter("commit_check_rate"), self._on_commit_timer
+        )
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -112,6 +123,34 @@ class UTOPlannerNode(Node):
         self.velocity_stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
 
     def _on_px4_velocity(self, message: VehicleOdometry) -> None:
+        now = self._now()
+        source_us = getattr(message, "timestamp_sample", 0) or message.timestamp
+        source_time = float(source_us) * 1e-6
+        mode = self._parameter("px4_velocity_time_mode")
+        observed_offset = now - source_time
+        if mode == "ros":
+            self.velocity_clock_offset = 0.0
+            if abs(observed_offset) > self._parameter("source_clock_tolerance"):
+                self.velocity = None
+                self.belief_stable = False
+                self.adapter.detector.invalidate()
+                self._publish_diagnostics("PX4 velocity ROS timestamp is not synchronized", "ERROR")
+                return
+        elif mode == "offset":
+            if self.velocity_clock_offset is None:
+                self.velocity_clock_offset = observed_offset
+            elif abs(observed_offset - self.velocity_clock_offset) > self._parameter(
+                "source_clock_tolerance"
+            ):
+                self.velocity = None
+                self.belief_stable = False
+                self.adapter.detector.invalidate()
+                self._publish_diagnostics("PX4 velocity clock domain changed", "ERROR")
+                return
+        else:
+            self.velocity = None
+            self._publish_diagnostics("unsupported PX4 velocity time mode", "ERROR")
+            return
         enu = ned_to_enu(message.velocity)
         try:
             self.velocity = align_enu_velocity(
@@ -119,9 +158,11 @@ class UTOPlannerNode(Node):
                 self._parameter("velocity_frame_alignment_mode"),
                 self._parameter("velocity_frame_yaw_offset"),
             )
-            self.velocity_stamp = float(message.timestamp) * 1e-6
+            self.velocity_stamp = source_time + self.velocity_clock_offset
         except ValueError as exception:
             self.velocity = None
+            self.belief_stable = False
+            self.adapter.detector.invalidate()
             self._publish_diagnostics(str(exception), "ERROR")
 
     def _velocity_for_odometry(self, message: Odometry, now: float):
@@ -134,7 +175,8 @@ class UTOPlannerNode(Node):
                 ]
             )
             return velocity, np.all(np.isfinite(velocity))
-        fresh = self.velocity is not None and now - self.velocity_stamp <= self._parameter(
+        velocity_age = now - self.velocity_stamp
+        fresh = self.velocity is not None and 0.0 <= velocity_age <= self._parameter(
             "velocity_timeout"
         )
         return self.velocity, fresh
@@ -143,6 +185,9 @@ class UTOPlannerNode(Node):
         now = self._now()
         stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
         velocity, velocity_ok = self._velocity_for_odometry(message, now)
+        if self._parameter("velocity_source") == "patched_odometry_twist" and velocity_ok:
+            self.velocity = velocity.copy()
+            self.velocity_stamp = stamp
         position = message.pose.pose.position
         orientation = message.pose.pose.orientation
         try:
@@ -158,6 +203,9 @@ class UTOPlannerNode(Node):
                 velocity_ok,
             )
         except ValueError as exception:
+            with self.lock:
+                self.belief_stable = False
+                self.adapter.detector.invalidate()
             self._publish_diagnostics(str(exception), "ERROR")
             return
         with self.lock:
@@ -169,6 +217,9 @@ class UTOPlannerNode(Node):
             self._publish_diagnostics("path frame mismatch", "ERROR")
             return
         stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+        if stamp <= 0.0:
+            self._publish_diagnostics("IFDS path header stamp is zero", "ERROR")
+            return
         points = [
             [pose.pose.position.x, pose.pose.position.y, pose.pose.position.z]
             for pose in message.poses
@@ -202,42 +253,38 @@ class UTOPlannerNode(Node):
             if not velocity_fresh:
                 velocity_fresh = (
                     self.velocity is not None
-                    and now - self.velocity_stamp <= self._parameter("velocity_timeout")
+                    and 0.0 <= now - self.velocity_stamp <= self._parameter("velocity_timeout")
                 )
             return PlannerSnapshot(
                 now, self.belief, self.belief_stable, self.path, dict(self.px4), velocity_fresh
             )
 
-    def _on_timer(self) -> None:
+    def _on_planning_timer(self) -> None:
+        """Low-rate planning scheduler; never performs commit or safety work."""
         snapshot = self._snapshot()
-        self._update_mission_state(snapshot)
-        if self.state in (
-            PlannerState.WAIT_PX4,
-            PlannerState.TAKEOFF,
-            PlannerState.HOLD,
-            PlannerState.WAIT_BELIEF_STABLE,
-            PlannerState.WAIT_IFDS_INITIAL_PATH,
-            PlannerState.SAFE_HOLD,
-            PlannerState.FAULT,
-        ):
-            self._publish_diagnostics()
+        if not self._should_request_plan(snapshot):
             return
+        try:
+            first = self.state in (PlannerState.BUILDING_NLP, PlannerState.FIRST_SOLVE)
+            request = self._make_request(snapshot, first)
+            if self.worker.submit(request, replace_pending=not first):
+                self.solve_in_progress = True
+                if first:
+                    self.first_request_submitted = True
+                    self.state = PlannerState.FIRST_SOLVE
+                else:
+                    self.state = PlannerState.REPLANNING
+        except ValueError as exception:
+            self._enter_safe_hold(str(exception), snapshot)
+
+    def _on_commit_timer(self) -> None:
+        """High-rate state, completion, commit, goal, freshness, and diagnostics loop."""
+        for event in self.worker.drain_completions():
+            self._on_solve_complete(event.request, event.result, event.stale)
+        snapshot = self._snapshot()
+        self._update_goal(snapshot)
+        self._update_mission_state(snapshot)
         self._commit_candidate_if_due(snapshot)
-        if self._should_request_plan(snapshot):
-            try:
-                request = self._make_request(
-                    snapshot, self.state in (PlannerState.BUILDING_NLP, PlannerState.FIRST_SOLVE)
-                )
-                replace = not request.first
-                if self.worker.submit(request, replace_pending=replace):
-                    self.solve_in_progress = True
-                    if request.first:
-                        self.first_request_submitted = True
-                        self.state = PlannerState.FIRST_SOLVE
-                    else:
-                        self.state = PlannerState.REPLANNING
-            except ValueError as exception:
-                self._enter_safe_hold(str(exception), snapshot)
         self._publish_diagnostics()
 
     def _update_mission_state(self, snapshot: PlannerSnapshot) -> None:
@@ -261,22 +308,23 @@ class UTOPlannerNode(Node):
         elif self.state == PlannerState.WAIT_IFDS_INITIAL_PATH and self._path_fresh(snapshot):
             self.state = PlannerState.BUILDING_NLP
         if self.state in (PlannerState.EXECUTING, PlannerState.REPLANNING):
-            if not self._data_fresh(snapshot) or self.buffer.remaining(snapshot.now) <= 0:
-                self._enter_safe_hold("runtime data or trajectory tail expired", snapshot)
+            if not self._data_fresh(snapshot):
+                self._enter_safe_hold("runtime data expired", snapshot)
+            elif self.buffer.remaining(snapshot.now) <= 0 and not self._goal_conditions(snapshot):
+                self._enter_safe_hold("trajectory expired before goal", snapshot)
 
     def _path_fresh(self, snapshot: PlannerSnapshot) -> bool:
         if snapshot.path is None:
             return False
         timeout = self._parameter("path_timeout")
-        return (
-            snapshot.now - snapshot.path["received"] <= timeout
-            and snapshot.now - snapshot.path["stamp"] <= timeout
-        )
+        receive_age = snapshot.now - snapshot.path["received"]
+        stamp_age = snapshot.now - snapshot.path["stamp"]
+        return 0.0 <= receive_age <= timeout and 0.0 <= stamp_age <= timeout
 
     def _data_fresh(self, snapshot: PlannerSnapshot) -> bool:
         return (
             snapshot.belief is not None
-            and snapshot.now - snapshot.belief.stamp <= self._parameter("belief_timeout")
+            and 0.0 <= snapshot.now - snapshot.belief.stamp <= self._parameter("belief_timeout")
             and snapshot.velocity_fresh
             and self._path_fresh(snapshot)
         )
@@ -400,7 +448,6 @@ class UTOPlannerNode(Node):
             self._parameter("planning_frame"),
         )
         if accepted:
-            self.last_path_generation = request.path_generation
             self.state = PlannerState.TRAJECTORY_READY if request.first else PlannerState.REPLANNING
         elif request.first:
             self.first_request_submitted = False
@@ -412,7 +459,20 @@ class UTOPlannerNode(Node):
     def _commit_candidate_if_due(self, snapshot: PlannerSnapshot) -> None:
         if not self.buffer.candidate_due(snapshot.now) or snapshot.belief is None:
             return
-        errors = commit_continuity_errors(self.buffer.candidate, snapshot.belief)
+        candidate = self.buffer.candidate
+        commit_status, lateness = commit_due_status(
+            snapshot.now, candidate, self._parameter("allowed_commit_lateness")
+        )
+        self.last_commit_lateness = lateness
+        if commit_status == "late":
+            self.buffer.discard_candidate()
+            self.manager.deadline_misses += 1
+            self.first_request_submitted = False
+            if self.buffer.remaining(snapshot.now) <= 0:
+                self._enter_safe_hold("candidate commit was too late", snapshot)
+            return
+        errors = commit_continuity_errors(candidate, snapshot.belief)
+        self.last_commit_errors = errors
         tolerances = (
             self._parameter("commit_position_tolerance"),
             self._parameter("commit_velocity_tolerance"),
@@ -420,6 +480,8 @@ class UTOPlannerNode(Node):
         )
         if all(error <= tolerance for error, tolerance in zip(errors, tolerances)):
             executable = self.buffer.commit_candidate()
+            self.last_path_generation = executable.path_generation
+            self.first_request_submitted = False
             self.trajectory_pub.publish(String(data=executable.to_json()))
             self.state = PlannerState.EXECUTING
             return
@@ -430,6 +492,28 @@ class UTOPlannerNode(Node):
         else:
             self.state = PlannerState.SAFE_HOLD
         self._publish_diagnostics("commit belief continuity rejected", "WARN")
+
+    def _goal_conditions(self, snapshot: PlannerSnapshot) -> bool:
+        if snapshot.belief is None or snapshot.path is None:
+            return False
+        goal = snapshot.path["polyline"].p[-1]
+        return np.linalg.norm(snapshot.belief.position - goal) <= self._parameter(
+            "goal_position_tolerance"
+        ) and np.linalg.norm(snapshot.belief.velocity) <= self._parameter("goal_velocity_tolerance")
+
+    def _update_goal(self, snapshot: PlannerSnapshot) -> None:
+        if self.state not in (PlannerState.EXECUTING, PlannerState.REPLANNING):
+            self.goal_since = None
+            return
+        self.goal_since, reached = update_goal_dwell(
+            self.goal_since,
+            snapshot.now,
+            self._goal_conditions(snapshot),
+            self.buffer.remaining(snapshot.now),
+            self._parameter("goal_dwell_time"),
+        )
+        if reached:
+            self.state = PlannerState.GOAL_REACHED
 
     def _enter_safe_hold(self, reason: str, snapshot: PlannerSnapshot) -> None:
         self.state = PlannerState.SAFE_HOLD
@@ -470,10 +554,29 @@ class UTOPlannerNode(Node):
             "stale_candidate_discard_count": self.manager.stale_discards,
             "nlp_build_count": self.nlp.build_count,
             "active_trajectory_remaining": self.buffer.remaining(self._now()),
+            "commit_lateness": self.last_commit_lateness,
+            "actual_commit_error": self.last_commit_errors,
+            "belief_age": self._now() - self.belief.stamp if self.belief else None,
+            "path_age": self._now() - self.path["stamp"] if self.path else None,
+            "velocity_age": (
+                self._now() - self.velocity_stamp if self.velocity is not None else None
+            ),
+            "velocity_clock_offset": self.velocity_clock_offset,
+            "worker_pending": self.worker.pending_count(),
+            "worker_solving": self.worker.solve_in_progress,
+            "active_path_generation": self.last_path_generation,
+            "candidate_path_generation": (
+                self.buffer.candidate.path_generation if self.buffer.candidate else None
+            ),
             "max_lgr_dynamics_residual": gate.max_lgr_dynamics_residual if gate else None,
             "gate_time": gate.elapsed if gate else 0.0,
             "gate_accepted": gate.accepted if gate else None,
             "gate_reasons": gate.reasons if gate else [],
+            "max_dense_mean_path_error": gate.max_dense_mean_path_error if gate else None,
+            "max_dense_sigma_path_error": gate.max_dense_sigma_path_error if gate else None,
+            "max_dense_velocity": gate.max_dense_velocity if gate else None,
+            "max_dense_attitude": gate.max_dense_attitude if gate else None,
+            "rollout_endpoint_error": gate.rollout_endpoint_error if gate else None,
             "first_request_submitted": self.first_request_submitted,
             "solve_in_progress": self.solve_in_progress,
         }

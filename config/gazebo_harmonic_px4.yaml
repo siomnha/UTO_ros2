@@ -11,6 +11,7 @@ px4_offboard_bridge:
     vehicle_local_position_topic: /fmu/out/vehicle_local_position_v1
     vehicle_command_ack_topic: /fmu/out/vehicle_command_ack
     setpoint_rate: 40.0
+    offboard_control_level: position
     hold_altitude: 1.5
     auto_arm_takeoff: true
     prestream_setpoints: 20

@@ -16,7 +16,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from .dynamics import dynamics
 from .math_utils import enu_to_ned, yaw_enu_to_ned
-from .planner_runtime import CommandState, Px4CommandSequencer
+from .planner_runtime import CommandState, Px4CommandSequencer, offboard_control_flags
 from .trajectory import ExecutionSetpoint, Trajectory, TrajectoryExecution
 
 
@@ -56,6 +56,7 @@ class PX4OffboardBridge(Node):
             "vehicle_local_position_topic": "/fmu/out/vehicle_local_position_v1",
             "vehicle_command_ack_topic": "/fmu/out/vehicle_command_ack",
             "setpoint_rate": 40.0,
+            "offboard_control_level": "position",
             "hold_altitude": 1.5,
             "auto_arm_takeoff": False,
             "prestream_setpoints": 20,
@@ -204,11 +205,9 @@ class PX4OffboardBridge(Node):
     def _publish_heartbeat(self) -> None:
         message = OffboardControlMode()
         message.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        message.position = True
-        message.velocity = True
-        message.acceleration = True
-        message.attitude = False
-        message.body_rate = False
+        flags = offboard_control_flags(self._parameter("offboard_control_level"))
+        for field, enabled in flags.items():
+            setattr(message, field, enabled)
         self.mode_pub.publish(message)
 
     def _publish_command(self, command: int) -> None:
@@ -237,7 +236,7 @@ class PX4OffboardBridge(Node):
         message.acceleration = [float(value) for value in enu_to_ned(acceleration)]
         message.jerk = [math.nan] * 3
         message.yaw = float(yaw_enu_to_ned(state[8]))
-        message.yawspeed = math.nan
+        message.yawspeed = float(-output.control[3])
         self.setpoint_pub.publish(message)
         self.setpoint_publish_count += 1
 

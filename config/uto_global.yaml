@@ -54,6 +54,15 @@ uto_planner:
     velocity_source: patched_odometry_twist
     horizon: 6.0
     lookahead_spacing: 0.60
+    commit_check_rate: 50.0
+    allowed_commit_lateness: 0.04
+    source_clock_tolerance: 0.50
+    px4_velocity_time_mode: offset
+    gate_dense_points_per_region: 15
+    gate_rollout_endpoint_tolerance: 0.30
+    goal_position_tolerance: 0.20
+    goal_velocity_tolerance: 0.20
+    goal_dwell_time: 1.0
     replan_rate: 0.75
     path_tube_radius: 1.00
     sigma_path_tube_radius: 1.20
