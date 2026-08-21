@@ -1,0 +1,24 @@
+px4_offboard_bridge:
+  ros__parameters:
+    use_sim_time: true
+    trajectory_topic: /uto/trajectory
+    execution_command_topic: /uto/execution_command
+    px4_state_topic: /uto/px4_status
+    offboard_control_mode_topic: /fmu/in/offboard_control_mode
+    trajectory_setpoint_topic: /fmu/in/trajectory_setpoint
+    vehicle_command_topic: /fmu/in/vehicle_command
+    vehicle_status_topic: /fmu/out/vehicle_status_v1
+    vehicle_local_position_topic: /fmu/out/vehicle_local_position_v1
+    vehicle_command_ack_topic: /fmu/out/vehicle_command_ack
+    setpoint_rate: 40.0
+    hold_altitude: 1.5
+    auto_arm_takeoff: true
+    prestream_setpoints: 20
+    hold_position_tolerance: 0.20
+    hold_velocity_tolerance: 0.25
+    px4_status_timeout: 0.50
+    command_retry_interval: 0.50
+    command_ack_timeout: 1.00
+    command_max_retries: 5
+    target_system: 1
+    target_component: 1
