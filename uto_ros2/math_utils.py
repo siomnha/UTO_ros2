@@ -18,3 +18,8 @@ def rot_to_euler(R):
 def enu_to_ned(v):
     v=np.asarray(v,float); return np.array([v[1],v[0],-v[2]])
 def yaw_enu_to_ned(yaw): return np.pi/2-yaw
+def ned_to_enu(v):
+    v=np.asarray(v,float); return np.array([v[1],v[0],-v[2]])
+def euler_to_quat(e):
+    r,p,y=np.asarray(e,float)/2; cr,sr,cp,sp,cy,sy=np.cos(r),np.sin(r),np.cos(p),np.sin(p),np.cos(y),np.sin(y)
+    return np.array([sr*cp*cy-cr*sp*sy,cr*sp*cy+sr*cp*sy,cr*cp*sy-sr*sp*cy,cr*cp*cy+sr*sp*sy])

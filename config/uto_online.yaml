@@ -2,18 +2,16 @@ uto_planner:
   ros__parameters:
     use_sim_time: true
     belief_topic: /Odometry
-    velocity_source: px4_vehicle_odometry
     path_topic: /ifds/local_path
+    velocity_topic: /uto/velocity
+    px4_velocity_topic: /fmu/out/vehicle_odometry
+    px4_state_topic: /uto/px4_status
     trajectory_topic: /uto/trajectory
     diagnostics_topic: /uto/diagnostics
     planning_frame: map
-    mode: online
-    horizon: 3.0
-    lookahead_count: 10
-    lookahead_spacing: 0.4
-    replan_rate: 1.5
     belief_timeout: 0.30
-    path_timeout: 0.8
+    path_timeout: 0.80
+    velocity_timeout: 0.30
     stable_samples: 5
     covariance_eigen_floor: 1.0e-9
     covariance_inflation: 1.2
@@ -24,16 +22,31 @@ uto_planner:
     regions: 2
     lgr_nodes_per_region: 5
     sigma_count: 7
-    path_tube_radius: 0.6
-    initial_delay: 0.5
+    lookahead_count: 10
+    initial_delay: 0.50
+    cold_start_delay: 1.20
     delay_p90_window: 20
+    minimum_delay: 0.20
+    maximum_delay: 1.50
+    validation_time: 0.02
     commit_margin: 0.08
     commit_guard: 0.05
+    terminal_position_tolerance: 0.30
     terminal_velocity_tolerance: 0.05
     process_noise_diagonal: [0.01,0.01,0.01,0.02,0.02,0.02,0.001,0.001,0.001]
     state_scale: [3.0,1.0,1.2,4.0,4.0,4.0,0.6,0.6,0.6]
     control_scale: [9.81,0.48,0.48,1.2]
-    weights: [2.0,10.0,0.007,10.0,1.0e-6,1.0e-6]
+    control_min: [0.0,-0.48,-0.48,-1.2]
+    control_max: [18.0,0.48,0.48,1.2]
+    velocity_max: 4.0
+    angle_max: 0.6
     solver_tolerance: 2.0e-5
-    solver_max_iterations: 500
-    fallback_behavior: safe_hold
+    solver_max_iterations: 900
+    mode: online
+    velocity_source: px4_vehicle_odometry
+    horizon: 3.0
+    lookahead_spacing: 0.40
+    replan_rate: 1.5
+    path_tube_radius: 0.80
+    sigma_path_tube_radius: 1.00
+    weights: [2.0,10.0,10.0,0.007,1.0e-6,1.0e-6]

@@ -1,9 +1,13 @@
+import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument,OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
-import os
+def _nodes(context):
+    mode=LaunchConfiguration('mode').perform(context)
+    if mode not in ('global','online'):raise RuntimeError("mode must be 'global' or 'online'")
+    share=get_package_share_directory('uto_ros2')
+    return [Node(package='uto_ros2',executable='uto_planner',name='uto_planner',output='screen',parameters=[os.path.join(share,'config',f'uto_{mode}.yaml')]),Node(package='uto_ros2',executable='px4_offboard_bridge',name='px4_offboard_bridge',output='screen',parameters=[os.path.join(share,'config','gazebo_harmonic_px4.yaml')])]
 def generate_launch_description():
-    share=get_package_share_directory('uto_ros2'); mode=LaunchConfiguration('mode')
-    return LaunchDescription([DeclareLaunchArgument('mode',default_value='online'),Node(package='uto_ros2',executable='uto_planner',parameters=[os.path.join(share,'config','uto_online.yaml')]),Node(package='uto_ros2',executable='px4_offboard_bridge',parameters=[os.path.join(share,'config','gazebo_harmonic_px4.yaml')])])
+    return LaunchDescription([DeclareLaunchArgument('mode',default_value='online',choices=['global','online'],description='Select matching planner YAML'),OpaqueFunction(function=_nodes)])

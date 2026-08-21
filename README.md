@@ -1,115 +1,139 @@
-# UTO ROS 2 — IFDS → Unscented Trajectory Optimisation → PX4
+# UTO ROS 2：FAST-LIO2 + IFDS + LGR UTO + PX4 Offboard
 
-This package implements a fixed-size, seven-sigma Unscented Trajectory Optimisation (UTO) local planner for ROS 2, with an IFDS `Path` input and a PX4 offboard output. The MATLAB program and paper in this repository remain the numerical references.
+本仓库实现一个 `ament_python` ROS 2 包：FAST-LIO2 提供 position/attitude belief，IFDS 只提供无碰路径，固定尺寸 CasADi/IPOPT UTO 生成动态可执行轨迹，独立 PX4 bridge 以 40 Hz 执行轨迹或安全 hold。MATLAB 文件和论文保留为数值参考。
 
-> **Safety limitation:** the current UTO NLP has no obstacle constraints and cannot independently guarantee collision safety. Dynamic avoidance depends on IFDS producing fresh collision-free paths, UTO tracking those paths, runtime validity checks, and PX4 safety fallback.
+> **安全边界：当前 UTO NLP 没有 obstacle constraints，不能单独保证碰撞安全。动态避障依赖 IFDS 及时发布无碰路径、UTO path/tube tracking、实时 admission gate 和 PX4 fallback。Path-tube 检查不等价于 collision checking。**
 
-## Architecture
+## 实际闭环
 
 ```text
-FAST-LIO2 /Odometry ─> belief adapter (6x6 position/SO(3) tangent covariance) ─┐
-PX4 velocity ─────────────────────────────────────────────────────────────────┤
-IFDS path-only /ifds/local_path ─> arc-length projection/lookahead ──────────┤
-active trajectory ─> sigma-level delay predictor ────────────────────────────┤
-                                                                             v
-      state machine -> latest-wins worker -> fixed CasADi/IPOPT UTO -> gate/buffer
-            |                                                           |
-            └──────────── SAFE_HOLD <──────── diagnostics ───────────────┘
-                                                                        |
-                        40 Hz independent PX4 bridge <───────────────────┘
-                          ENU/map -> NED -> PX4 /fmu/in/*
+FAST-LIO /Odometry (pose, quaternion, full 6x6 covariance)
+       + configured fresh velocity
+       -> covariance sanitize -> SO(3) simplex 7 sigma states -> stable detector
+IFDS /ifds/local_path -> frame/freshness/hash -> Polyline -> commit-position lookahead
+active trajectory control -> RK4 sigma prediction -> P90 commit belief
+       -> one latest-wins worker -> reusable 2x5 LGR CasADi/IPOPT graph
+       -> feasibility gate -> candidate buffer -> atomic commit
+       -> /uto/trajectory (validated physical JSON v1)
+       -> independent PX4 bridge -> interpolation -> ENU/NED -> PX4 setpoints
 ```
 
-The planner callback thread only updates snapshots and submits requests. One background worker owns IPOPT; a newer request replaces the pending request, never starts a concurrent solve, and makes the old result stale. The PX4 timer is in a separate node/process, so cold graph construction or IPOPT cannot interrupt heartbeat/setpoints.
+Planner 和 bridge 是不同进程；IPOPT build/solve 不在 ROS callback 或 PX4 setpoint timer 中运行。旧 solve 若因 pending request 变 stale，只计数并丢弃，不触发 hold。只有数据失效、solve/gate 失败且没有安全 active tail、PX4 failsafe 或 trajectory 结束才进入安全 hold。
 
-## Mathematical model
+## 数学模型与真正的 LGR transcription
 
-The physical state is `x=[p(3),v(3),roll,pitch,yaw]`, control is `[thrust acceleration, roll command, pitch command, yaw rate]`, and initial uncertainty is `z=[p(3),delta_theta(3)]`. Seven equal-weight regular-simplex points exactly reconstruct the supplied 6-D covariance. Attitude points use `R_i=R_mean Exp(delta_theta_i)`, not Euclidean Euler perturbations.
+状态为 `[px,py,pz,vx,vy,vz,roll,pitch,yaw]`，控制为 `[thrust_acceleration,roll_command,pitch_command,yaw_rate]`。初始随机变量是 position 和 SO(3) tangent attitude 共 6 维。七个等权 regular-simplex 点重建 full covariance；姿态点严格使用 `R_i=R_mean Exp(delta_theta_i)`。
 
-The dynamics reproduce the MATLAB model: thrust is rotated into the world frame, gravity and linear drag are applied, roll/pitch follow first-order command dynamics (`tau=0.35 s`), and yaw integrates yaw rate. State/control scaling is explicit. One graph contains 2 regions × 5 nodes, seven state trajectories, one shared control, velocity/attitude/control bounds, mean path tracking at fixed references, terminal mean position/velocity and position-covariance costs, effort and smoothness. Initial sigma states, references, horizon, mode, weights and velocity bounds are CasADi parameters. `regions`, `lgr_nodes_per_region`, `sigma_count`, and reference count are **startup-only** because they set graph dimensions.
+`uto_ros2/lgr.py` 移植 MATLAB 的 Jacobi eigenvalue LGR nodes、barycentric differentiation matrix、endpoint interpolation 和 moment-matching quadrature。`uto_nlp.py` 使用 `X[sigma][region]` 二维 CasADi variables，默认 2 regions × 5 LGR nodes：
 
-The Python graph uses fixed-node direct transcription. The repository's LGR MATLAB reference documents the original differentiation and quadrature operators; further fidelity validation against MATLAB is required before real flight.
+* 每条 sigma trajectory 都满足 `X Dᵀ = duration/2 f_normalized`；
+* region state continuity 和 endpoint-interpolated shared-control continuity；
+* shared physical control、velocity、roll/pitch 和 control bounds；
+* 多个 LGR node 上的 mean IFDS path tracking；
+* terminal mean-position tolerance、mean-velocity bounds、position covariance trace；
+* terminal velocity、control effort 和 LGR control-rate smoothness cost；
+* extraction 后 state/control 全部恢复 SI physical units，并输出每个样本的 UT covariance。
 
-## Nodes and ROS interfaces
+初始 sigma states、K 个 references、horizon、mode、weights、terminal bounds/tolerance是 parameters。`build()` 幂等；同一个 worker 是唯一 solver owner。`regions`、`lgr_nodes_per_region`、`sigma_count`、`lookahead_count`、state/control dimensions/scales 是 **startup-only**，改变它们必须重启节点，不会在线 rebuild。
 
-| Node | Subscribes | Publishes | Responsibility |
-|---|---|---|---|
-| `uto_planner` | `/Odometry` (`nav_msgs/Odometry`), `/ifds/local_path` (`nav_msgs/Path`) | `/uto/trajectory`, `/uto/diagnostics` (`std_msgs/String`, JSON) | belief/path snapshots, fixed NLP, async latest-wins replanning |
-| `px4_offboard_bridge` | `/uto/trajectory`, `/fmu/out/vehicle_status_v1` | `/fmu/in/offboard_control_mode`, `/fmu/in/trajectory_setpoint`, `/fmu/in/vehicle_command` | uninterrupted hold/offboard stream and ENU→NED boundary |
+## ROS interfaces
 
-JSON trajectory is intentionally minimal pending selection of a site-standard trajectory message. Important parameters are documented in the three YAML files: frames/topics, timeouts, covariance thresholds, horizon/lookahead/tube, P90 window/margins, process noise, scales, bounds/weights, IPOPT tolerances, rates, takeoff and fallback.
+| Node | Input | Output |
+|---|---|---|
+| `uto_planner` | `/Odometry` `nav_msgs/Odometry`; `/ifds/local_path` `nav_msgs/Path`; `/uto/px4_status` JSON; optional velocity | `/uto/trajectory`; `/uto/diagnostics` |
+| `px4_offboard_bridge` | `/uto/trajectory`; `/fmu/out/vehicle_status_v1`; `/fmu/out/vehicle_local_position_v1` | `/fmu/in/offboard_control_mode`; `/fmu/in/trajectory_setpoint`; `/fmu/in/vehicle_command`; `/uto/px4_status` |
 
-The intended state progression is `WAIT_PX4 → TAKEOFF → HOLD → WAIT_BELIEF_STABLE → WAIT_IFDS_INITIAL_PATH → BUILDING_NLP → FIRST_SOLVE → TRAJECTORY_READY → EXECUTING ↔ REPLANNING`, with `GOAL_REACHED`, `SAFE_HOLD`, and `FAULT` exits. No trajectory may execute before stable belief, fresh path, successful first solve, and feasibility admission.
+### Physical trajectory schema
 
-## FAST-LIO2 belief contract
+ROS distributions/PX4 workspaces do not consistently install `trajectory_msgs`, so this package currently uses a validated, versioned `std_msgs/String` JSON schema rather than an un-timed ad-hoc list:
 
-`Odometry.pose.covariance` must be mapped deliberately into the full `[position, attitude-tangent]` 6×6 covariance, retaining cross terms. The adapter symmetrises it, rejects non-finite/all-zero/meaningfully indefinite matrices, floors eigenvalues, and inflates covariance. Stability additionally requires fresh messages, available TF, valid velocity, trace thresholds, and N consecutive samples with bounded mean/covariance changes.
-
-**Verify in your FAST-LIO2 build** the covariance block ordering and publish timing, and whether `/Odometry.twist` is actually populated. Configure velocity as PX4 `VehicleOdometry`, a separate velocity topic, or explicitly patched odometry twist. Missing/stale velocity is a hold condition; it must never silently become zero. This repository does not patch FAST-LIO2.
-
-## IFDS connection
-
-Run IFDS in **path-only** mode. IFDS is the path provider, UTO is the only local trajectory generator, and this PX4 bridge is the only low-level setpoint publisher. Disable IFDS/MAVROS direct setpoint publication. Both systems must use the same planning frame (normally ENU `map`) or provide an explicit TF2 transform.
-
-Recommended QoS is reliable/volatile depth 5–10 for path, 2–5 Hz for dynamic paths and 0.5–1 Hz for static paths. Every dynamic update must change `header.stamp`; UTO combines timestamp and path content hash into a generation ID. Lookahead begins at the delay-predicted commit position projected onto the polyline, then samples a fixed K by arc length with endpoint padding.
-
-```bash
-ros2 run your_ifds_pkg ifds_node --ros-args -p path_only:=true -r local_path:=/ifds/local_path
-ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online \
-  --ros-args -r /Odometry:=/fast_lio/Odometry
+```json
+{"schema":"uto_trajectory/v1","generation":1,"path_generation":"hash","frame_id":"map","commit_time_ns":0,"times":[0.0],"states_physical":[[0,0,1,0,0,0,0,0,0]],"controls_physical":[[9.81,0,0,0]],"mean_covariances":[[[0]]]}
 ```
 
-Global mode uses a longer horizon and 0.75 Hz requests. Online mode uses a shorter horizon and 1.5 Hz latest-wins requests; intermediate IFDS updates may be coalesced. Dynamic avoidance is “IFDS changes path + UTO tracks path”, not collision avoidance inside UTO. `/ifds/obstacles` is deliberately not decoded because no message type/schema was specified; a future typed adapter may add post-checking only.
+Real arrays have shapes `times=[N]`, `states_physical=[N,9]`, `controls_physical=[N or N-1,4]`, covariance `[N,9,9]`. Parser validates schema, dimensions, finite values and monotonic time. Bridge interpolates by ROS time, switches only at `commit_time_ns`, and returns to hold after the last sample—never extrapolates an expired path.
 
-## Delay, buffering, feasibility and diagnostics
+## FAST-LIO belief and velocity
 
-Commit delay is `clamp(P90(solve window)+validation/interface margin)`, falling back to 0.5 s while samples are sparse. Seven sigma states are propagated with active controls and RK4, process noise is added, and lookahead is selected from the predicted mean. Candidate time zero is its commit instant. A candidate finishing after `commit-guard`, carrying stale generations, or disagreeing with actual commit belief must be discarded.
+ROS pose covariance ordering `[x,y,z,rotation_x,rotation_y,rotation_z]` is mapped intact into tangent `[position,delta_theta]`, including position-attitude cross blocks. It is checked for finite values, symmetrised, rejected if all-zero or meaningfully indefinite, eigenvalue-floored and inflated. Quaternion is converted to `R_mean`, then seven SO(3) sigma states are generated.
 
-The runtime gate is designed to check solver status, finite values, dynamics residual, bounds, terminal/path error, monotonic horizon coverage, generation freshness, start continuity, and mean/all-sigma path tube. An invalid or exhausted trajectory causes hold, not extrapolation. Diagnostics separate cold build, parameter update, solve, extraction, gate and end-to-end time plus iterations, deadline misses, stale discards and setpoint jitter. The current implementation publishes build/solve/generation; remaining gate/timing counters are integration work and must be completed before flight qualification.
+`velocity_source` supports:
 
-## Frames and PX4
+* `patched_odometry_twist`: read `/Odometry.twist` explicitly;
+* `px4_vehicle_odometry`: subscribe `/fmu/out/vehicle_odometry`, convert PX4 NED velocity to ENU and enforce `velocity_timeout`;
+* `separate_velocity_topic`: subscribe a planning-frame `geometry_msgs/TwistStamped`.
 
-FAST-LIO/IFDS use ENU/map. The bridge alone converts vectors as `[E,N,U]→[N,E,-U]` and yaw as `pi/2-yaw` for PX4 NED/FRD conventions. ROS time honors `use_sim_time`. The code targets PX4 ROS 2 topics `/fmu/in/offboard_control_mode`, `/fmu/in/trajectory_setpoint`, and `/fmu/out/vehicle_status_v1`; confirm these and every `px4_msgs` field against the exact PX4/px4_msgs checkout used to build the workspace.
+Missing/non-finite/stale configured velocity is rejected and diagnosed; it is never silently replaced by zero. Check the exact FAST-LIO covariance write order/timestamp and whether its twist is populated. This repository does not modify FAST-LIO2.
 
-Simulation YAML permits automatic arm/takeoff. Real vehicles must use a separate override with `auto_arm_takeoff: false` (the conservative default in code), tested failsafe, geofence, RC takeover and an independent kill path.
+Belief becomes stable only after `stable_samples` consecutive fresh, frame-correct, finite, nonzero PSD samples below position/attitude trace thresholds, with mean and covariance deltas below configured limits. NLP build cannot start before PX4 hold-ready, stable belief and a valid initial path.
 
-## Build and launch (Gazebo Harmonic + PX4 SITL)
+## IFDS contract
+
+IFDS must run **path-only**. Disable all IFDS/MAVROS/PX4 direct setpoint outputs. IFDS is the path provider, UTO is the only local trajectory generator, PX4 bridge is the only low-level publisher. IFDS and UTO must use the same planning frame; this release rejects a mismatched frame rather than silently using it (transform the IFDS path upstream if needed).
+
+Every dynamic update must update `header.stamp`; generation is timestamp + content hash. Planner checks receive freshness, projects the delay-predicted commit position onto the polyline and arc-length samples exactly K references with endpoint padding. Suggested publication: static 0.5–1 Hz, dynamic 2–5 Hz, reliable volatile depth 5–10.
+
+## State machine, delay and modes
+
+Real state sequence is:
+
+`WAIT_PX4 → TAKEOFF → HOLD → WAIT_BELIEF_STABLE → WAIT_IFDS_INITIAL_PATH → BUILDING_NLP → FIRST_SOLVE → TRAJECTORY_READY → EXECUTING ↔ REPLANNING`, plus `GOAL_REACHED`, `SAFE_HOLD`, `FAULT`.
+
+Bridge prestreams setpoints, optionally sends PX4 custom-main-mode OFFBOARD and arm commands, climbs/holds at `hold_altitude`, and reports hold-ready. Simulation sets `auto_arm_takeoff=true`; code/default for a real vehicle is false.
+
+For replanning, commit delay is `clamp(P90(solve)+validation_time+commit_margin,min,max)`; sparse history uses `initial_delay`, while cold graph build uses `cold_start_delay`. Seven sigma states propagate from belief timestamp through active physical controls to commit with RK4, and `Q_delay*dt` is added to covariance. A result arriving after `commit-commit_guard`, with stale request/path/belief generation, failing continuity or gate checks is discarded. Active trajectory continues until its safe end.
+
+* `mode:=global`: 6 s horizon, 0.75 Hz check; unchanged path does not re-solve until the active tail is short.
+* `mode:=online`: 3 s horizon, 1.5 Hz latest-wins; intermediate dynamic path updates coalesce naturally.
+
+Both use the same fixed graph structure; only parameters differ.
+
+## Parameters
+
+All parameters in `config/uto_global.yaml`, `config/uto_online.yaml`, and `config/gazebo_harmonic_px4.yaml` are declared and consumed. Groups include topics/frames/source, mode/horizon/lookahead/rate, freshness and stability, covariance floor/inflation, process noise, LGR startup dimensions, scales/bounds/weights/IPOPT settings, terminal tolerances, tube limits, P90 window/delay/guard, bridge rate/hold/auto-arm/status timeout.
+
+## Diagnostics
+
+`/uto/diagnostics` JSON reports mission state/reason, cold build time (once), parameter update, IPOPT solve/P90, extraction, predicted commit delay, deadline misses, stale discards, build count and active remaining time. `/uto/px4_status` reports connection, hold-ready, failsafe, arm/nav states, output mode, maximum setpoint jitter and active remaining time.
+
+Cold start is `build + first update + first solve + extraction + gate`; steady online excludes build. Build time is never added again.
+
+## Build and Gazebo Harmonic + PX4 SITL
+
+Confirm the installed PX4 and `px4_msgs` are matching checkouts. This code uses current-style `/fmu/in/*`, `/fmu/out/vehicle_status_v1`, `/fmu/out/vehicle_local_position_v1`, and `/fmu/out/vehicle_odometry`; inspect `ros2 topic list/type` and generated message fields in your workspace before launching.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-python3 -m pip install casadi numpy pytest
-cd ~/ros2_ws/src && git clone https://github.com/siomnha/UTO_ros2.git
-cd ~/ros2_ws && rosdep install --from-paths src -yi
+cd ~/ros2_ws
+rosdep install --from-paths src -yi
+python3 -m pip install casadi
 colcon build --symlink-install --packages-select uto_ros2
 source install/setup.bash
 ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online
+# or: mode:=global
 ```
 
-Complete launch order:
-1. Gazebo Harmonic and PX4 SITL; 2. sensors and FAST-LIO2; 3. IFDS path-only; 4. UTO planner/bridge; 5. IFDS goal/mission enable; 6. PX4 takeoff and hold; 7. wait for stable belief; 8. wait for initial path; 9. build NLP once; 10. first solve; 11. execute; 12. online replan.
+Launch order: Gazebo/PX4 SITL → Micro XRCE-DDS agent → sensors/FAST-LIO2 → IFDS path-only → UTO launch → IFDS goal. Then observe takeoff/hold, stable belief, first build/solve/commit and execution.
 
 ```bash
 ros2 topic hz /fmu/in/trajectory_setpoint
-ros2 topic hz /ifds/local_path
+ros2 topic echo /uto/px4_status
 ros2 topic echo /uto/diagnostics
-ros2 topic echo /fmu/out/vehicle_status_v1
+ros2 topic hz /ifds/local_path
 ros2 topic echo /Odometry --once
 ```
 
-## Tests and troubleshooting
+## Tests
 
 ```bash
-python3 -m pytest -q test/test_core.py
-python3 -m pytest -q test/test_solver_optional.py  # skipped without CasADi/IPOPT
+python3 -m pytest -q test/test_core.py test/test_mock_pipeline.py
+python3 -m pytest -q test/test_solver_optional.py
+colcon build --packages-select uto_ros2
 colcon test --packages-select uto_ros2 && colcon test-result --verbose
 ```
 
-* Never leaves hold: check fresh timestamps, TF/frame agreement, nonzero covariance, covariance traces, and the configured velocity source.
-* IPOPT fails: inspect normalization, horizon, velocity bounds, path discontinuities and initial covariance; do not loosen gates blindly.
-* PX4 rejects offboard: verify bridge rate >2 Hz (configured 40 Hz), DDS agent, exact px4_msgs branch/topic suffix, nav/arming/failsafe state, and timesync.
-* Cutting corners: increase path tracking weight/density and reduce horizon; remember this is not an obstacle-constrained optimizer.
-* Late candidates: reduce request rate/horizon only after examining P90 solve time; latest-wins intentionally drops intermediate paths.
+Tests cover simplex/full cross covariance, SO(3), LGR polynomial differentiation/quadrature, MATLAB hover dynamics, frames, belief stability, trajectory schema/interpolation, delay/P90, state sequence, latest-wins shutdown, gate/late/stale rejection and mock first/replan/expiry. The optional solver test builds and solves a small CasADi/IPOPT graph twice, asserts one build, distinct sigma states, physical output and PSD terminal covariance.
 
-## Current qualification status
+## Qualification and real-flight checklist
 
-The pure-Python math, path, delay, buffer, state and concurrency units are testable without ROS/Gazebo. CasADi, ROS 2, PX4 and Gazebo integration tests require those dependencies. Before vehicle use, add the site-specific velocity/TF adapters, complete the full feasibility gate and command/arming state handling, validate transcription numerically against MATLAB, run SITL fault injection, and review all safety behavior.
+The repository must first pass the above tests and an actual Gazebo Harmonic/PX4 SITL fault-injection run in the target workspace. Before real flight: keep auto-arm false; verify exact PX4 topics/constants/fields and timesync; add/validate site TF if frames differ; validate Python LGR results against the MATLAB mission; test estimator/path/velocity/PX4 loss, late solve and DDS interruption; configure geofence, RC override and kill switch; independently review admission thresholds and vehicle bounds. Absence of UTO obstacle constraints remains a fundamental limitation.

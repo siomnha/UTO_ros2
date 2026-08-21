@@ -1,7 +1,7 @@
 from setuptools import find_packages, setup
 from glob import glob
 
-setup(name='uto_ros2', version='0.1.0', packages=find_packages(),
+setup(name='uto_ros2', version='0.2.0', packages=find_packages(),
       data_files=[('share/ament_index/resource_index/packages',['resource/uto_ros2']),
                   ('share/uto_ros2',['package.xml']),
                   ('share/uto_ros2/launch',glob('launch/*.launch.py')),
