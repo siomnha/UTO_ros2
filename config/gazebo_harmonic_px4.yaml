@@ -1,0 +1,10 @@
+px4_offboard_bridge:
+  ros__parameters:
+    use_sim_time: true
+    trajectory_topic: /uto/trajectory
+    setpoint_rate: 40.0
+    hold_altitude: 1.5
+    auto_arm_takeoff: true
+    px4_status_timeout: 0.5
+    real_vehicle: false
+    fallback_behavior: position_hold
