@@ -1,0 +1,14 @@
+px4_offboard_bridge:
+  ros__parameters:
+    use_sim_time: true
+    trajectory_topic: /uto/trajectory
+    px4_state_topic: /uto/px4_status
+    setpoint_rate: 40.0
+    hold_altitude: 1.5
+    auto_arm_takeoff: true
+    prestream_setpoints: 20
+    hold_position_tolerance: 0.20
+    hold_velocity_tolerance: 0.25
+    px4_status_timeout: 0.50
+    target_system: 1
+    target_component: 1
