@@ -3,6 +3,8 @@ uto_planner:
     use_sim_time: true
     belief_topic: /Odometry
     path_topic: /ifds/local_path
+    mission_goal_topic: /ifds/mission_goal
+    mission_goal_timeout: 0.0
     velocity_topic: /uto/velocity
     px4_velocity_topic: /fmu/out/vehicle_odometry
     px4_state_topic: /uto/px4_status
@@ -35,6 +37,9 @@ uto_planner:
     maximum_delay: 1.50
     validation_time: 0.02
     commit_margin: 0.08
+    commit_scheduling_margin: 0.02
+    latency_clip_min: 0.05
+    latency_clip_max: 1.50
     commit_guard: 0.05
     commit_position_tolerance: 0.50
     commit_velocity_tolerance: 0.70
@@ -59,9 +64,13 @@ uto_planner:
     source_clock_tolerance: 0.50
     px4_velocity_time_mode: offset
     gate_dense_points_per_region: 15
-    gate_rollout_endpoint_tolerance: 0.30
+    gate_rollout_endpoint_position_tolerance: 0.30
+    gate_rollout_endpoint_velocity_tolerance: 0.50
+    gate_rollout_endpoint_attitude_tolerance: 0.20
     goal_position_tolerance: 0.20
     goal_velocity_tolerance: 0.20
+    goal_yaw_enabled: false
+    goal_yaw_tolerance: 0.20
     goal_dwell_time: 1.0
     replan_rate: 1.5
     path_tube_radius: 0.80

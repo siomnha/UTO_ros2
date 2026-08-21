@@ -8,7 +8,7 @@ import queue
 import time
 from typing import Callable
 import numpy as np
-from .belief_adapter import reconstruct_belief_from_sigma, resample_sigma_states
+from .belief_adapter import joint_sigma_process_update
 from .dynamics import rk4
 from .lgr import interpolate_control
 from .ifds_path_adapter import Polyline
@@ -32,6 +32,21 @@ class PlannerState(Enum):
     FAULT = auto()
 
 
+class ExecutionDecision(Enum):
+    COMMIT = auto()
+    CONTINUE = auto()
+    SAFE_HOLD = auto()
+    GOAL_REACHED = auto()
+
+
+class CommitOutcome(Enum):
+    NONE = auto()
+    WAITING = auto()
+    COMMITTED = auto()
+    REJECTED = auto()
+    LATE = auto()
+
+
 @dataclass(frozen=True)
 class PlanningRequest:
     request_generation: int
@@ -46,6 +61,40 @@ class PlanningRequest:
     references: np.ndarray
     path: Polyline
     first: bool = False
+    enqueue_monotonic: float = 0.0
+
+
+@dataclass(frozen=True)
+class TimingBreakdown:
+    enqueue_time: float
+    worker_start_time: float
+    nlp_prepare_time: float
+    ipopt_solve_time: float
+    extraction_time: float
+    dense_gate_time: float
+    worker_completion_time: float
+    worker_total_time: float
+
+    def __post_init__(self):
+        values = (
+            self.enqueue_time,
+            self.worker_start_time,
+            self.nlp_prepare_time,
+            self.ipopt_solve_time,
+            self.extraction_time,
+            self.dense_gate_time,
+            self.worker_completion_time,
+            self.worker_total_time,
+        )
+        if not all(np.isfinite(value) and value >= 0.0 for value in values):
+            raise ValueError("timing values must be finite and nonnegative")
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    solve_result: dict
+    gate_result: object
+    timing: TimingBreakdown
 
 
 @dataclass
@@ -62,7 +111,9 @@ class GateConfig:
     minimum_horizon: float = 0.2
     residual_limit: float = 1e-4
     dense_points_per_region: int = 15
-    rollout_endpoint_tolerance: float = 0.3
+    rollout_endpoint_position_tolerance: float = 0.3
+    rollout_endpoint_velocity_tolerance: float = 0.5
+    rollout_endpoint_attitude_tolerance: float = 0.2
 
 
 @dataclass
@@ -77,7 +128,9 @@ class GateResult:
     max_dense_sigma_path_error: float
     max_dense_velocity: float
     max_dense_attitude: float
-    rollout_endpoint_error: float
+    max_dense_endpoint_position_error: float
+    max_dense_endpoint_velocity_error: float
+    max_dense_endpoint_attitude_error: float
 
 
 class FeasibilityGate:
@@ -168,9 +221,13 @@ class FeasibilityGate:
             reasons.append("dense velocity bound")
         if dense[3] > self.config.angle_max + 1e-5:
             reasons.append("dense attitude bound")
-        if dense[4] > self.config.rollout_endpoint_tolerance:
-            reasons.append("rollout endpoint consistency")
-        if dense[5]:
+        if dense[4] > self.config.rollout_endpoint_position_tolerance:
+            reasons.append("rollout endpoint position")
+        if dense[5] > self.config.rollout_endpoint_velocity_tolerance:
+            reasons.append("rollout endpoint velocity")
+        if dense[6] > self.config.rollout_endpoint_attitude_tolerance:
+            reasons.append("rollout endpoint attitude")
+        if dense[7]:
             reasons.append("dense control bound")
         return GateResult(
             not reasons,
@@ -179,7 +236,7 @@ class FeasibilityGate:
             mean_error,
             sigma_error,
             residual,
-            *dense[:5],
+            *dense[:7],
         )
 
     def _dense_rollout(self, result: dict, request: PlanningRequest) -> tuple:
@@ -189,11 +246,11 @@ class FeasibilityGate:
         regions = int(result.get("regions", 0))
         horizon = float(result.get("horizon", 0.0))
         if controls is None or endpoints is None or nodes is None or regions < 1 or horizon <= 0:
-            return (np.inf, np.inf, np.inf, np.inf, np.inf, True)
+            return (np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, True)
         states = np.asarray(request.sigma_states, dtype=float).T.copy()
         duration = horizon / regions
         points = self.config.dense_points_per_region
-        metrics = [0.0] * 5
+        metrics = [0.0] * 7
         control_violation = False
         for region in range(regions):
             step = duration / points
@@ -203,7 +260,7 @@ class FeasibilityGate:
                 control = dense_controls[:, index]
                 states = np.stack([rk4(state, control, step) for state in states])
                 if not np.all(np.isfinite(states)) or not np.all(np.isfinite(control)):
-                    return (np.inf, np.inf, np.inf, np.inf, np.inf, True)
+                    return (np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, True)
                 control_violation |= bool(
                     np.any(control < np.asarray(self.config.control_min) - 1e-5)
                     or np.any(control > np.asarray(self.config.control_max) + 1e-5)
@@ -212,10 +269,18 @@ class FeasibilityGate:
                 metrics[1] = max(metrics[1], max(request.path.project(p)[2] for p in states[:, :3]))
                 metrics[2] = max(metrics[2], float(np.max(np.abs(states[:, 3:6]))))
                 metrics[3] = max(metrics[3], float(np.max(np.abs(states[:, 6:8]))))
-            metrics[4] = max(
-                metrics[4],
-                float(np.max(np.linalg.norm(states - np.asarray(endpoints[region]), axis=1))),
-            )
+            lgr_endpoint = np.asarray(endpoints[region])
+            for rollout_state, endpoint_state in zip(states, lgr_endpoint):
+                metrics[4] = max(
+                    metrics[4], float(np.linalg.norm(rollout_state[:3] - endpoint_state[:3]))
+                )
+                metrics[5] = max(
+                    metrics[5], float(np.linalg.norm(rollout_state[3:6] - endpoint_state[3:6]))
+                )
+                attitude_error = so3_log(
+                    euler_to_rot(endpoint_state[6:9]).T @ euler_to_rot(rollout_state[6:9])
+                )
+                metrics[6] = max(metrics[6], float(np.linalg.norm(attitude_error)))
         return (*metrics, control_violation)
 
 
@@ -230,6 +295,9 @@ class DelayPredictor:
         maximum: float,
         validation: float,
         margin: float,
+        scheduling_margin: float = 0.02,
+        latency_clip_min: float = 0.0,
+        latency_clip_max: float = 2.0,
     ) -> None:
         self.samples = deque(maxlen=window)
         self.default = default
@@ -237,9 +305,22 @@ class DelayPredictor:
         self.maximum = maximum
         self.validation = validation
         self.margin = margin
+        self.scheduling_margin = scheduling_margin
+        self.latency_clip_min = latency_clip_min
+        self.latency_clip_max = latency_clip_max
+
+    def record_latency(self, elapsed: float) -> None:
+        if not np.isfinite(elapsed) or elapsed < 0.0:
+            raise ValueError("latency must be finite and nonnegative")
+        self.samples.append(float(np.clip(elapsed, self.latency_clip_min, self.latency_clip_max)))
 
     def record_solve_time(self, elapsed: float) -> None:
-        self.samples.append(float(elapsed))
+        """Backward-compatible alias; values now mean full admission latency."""
+        self.record_latency(elapsed)
+
+    @property
+    def estimate_mode(self) -> str:
+        return "steady_p90" if len(self.samples) >= 3 else "cold"
 
     def percentile90(self) -> float:
         if len(self.samples) < 3:
@@ -249,7 +330,7 @@ class DelayPredictor:
     def estimate(self) -> float:
         return float(
             np.clip(
-                self.percentile90() + self.validation + self.margin,
+                self.percentile90() + self.validation + self.margin + self.scheduling_margin,
                 self.minimum,
                 self.maximum,
             )
@@ -278,19 +359,13 @@ class DelayPredictor:
                 [rk4(propagated[:, sigma], control, step) for sigma in range(propagated.shape[1])],
                 axis=1,
             )
-        mean, rotation, covariance = reconstruct_belief_from_sigma(propagated)
-        velocity_deviations = propagated[3:6] - mean[3:6, None]
         process = np.asarray(process_noise_diagonal, dtype=float)
         if process.shape == (9,):
             process = process[[0, 1, 2, 6, 7, 8]]
         if process.shape != (6,):
             raise ValueError("delay process noise must have 6 or 9 diagonal entries")
-        covariance = covariance + np.diag(process) * duration
-        resampled = resample_sigma_states(mean, rotation, covariance)
-        resampled[3:6] = mean[3:6, None] + velocity_deviations
-        # Floating point drift must not alter the propagated mean velocity.
-        resampled[3:6] -= resampled[3:6].mean(axis=1, keepdims=True) - mean[3:6, None]
-        return resampled, mean, rotation, covariance
+        pose_process = np.diag(process) * duration
+        return joint_sigma_process_update(propagated, pose_process)
 
 
 @dataclass(frozen=True)
@@ -398,6 +473,70 @@ class CandidateManager:
             result["mean_covariances"],
         )
         return self.buffer.offer(trajectory), "accepted"
+
+
+def execution_decision(
+    outcome: CommitOutcome,
+    data_fresh: bool,
+    active_remaining: float,
+    goal_reached: bool,
+    goal_dwell_pending: bool = False,
+) -> ExecutionDecision:
+    """Resolve one mutually exclusive execution action for a commit tick."""
+    if outcome == CommitOutcome.COMMITTED:
+        return ExecutionDecision.COMMIT
+    if goal_reached:
+        return ExecutionDecision.GOAL_REACHED
+    # An expired terminal trajectory is still a valid terminal-hold semantic
+    # while an explicitly supplied mission goal is accumulating dwell time.
+    if goal_dwell_pending:
+        return ExecutionDecision.CONTINUE
+    if not data_fresh or active_remaining <= 0.0:
+        return ExecutionDecision.SAFE_HOLD
+    return ExecutionDecision.CONTINUE
+
+
+def mission_goal_input_valid(
+    stamp: float,
+    now: float,
+    frame_id: str,
+    planning_frame: str,
+    position,
+    timeout: float,
+) -> bool:
+    """Validate an explicit persistent or time-limited mission goal."""
+    if stamp <= 0.0 or frame_id != planning_frame or not np.all(np.isfinite(position)):
+        return False
+    age = now - stamp
+    return age >= 0.0 and (timeout <= 0.0 or age <= timeout)
+
+
+def goal_generation_changed(previous, current: str) -> bool:
+    return previous is None or previous.generation != current
+
+
+def mission_goal_satisfied(
+    belief,
+    goal,
+    position_tolerance: float,
+    velocity_tolerance: float,
+    yaw_enabled: bool,
+    yaw_tolerance: float,
+) -> bool:
+    """Check only an explicit mission goal, never a local path endpoint."""
+    if belief is None or goal is None:
+        return False
+    position_ok = np.linalg.norm(belief.position - goal.position) <= position_tolerance
+    velocity_ok = np.linalg.norm(belief.velocity) <= velocity_tolerance
+    if not yaw_enabled:
+        return bool(position_ok and velocity_ok)
+    yaw_error = abs(
+        np.arctan2(
+            np.sin(belief.mean_state[8] - goal.yaw),
+            np.cos(belief.mean_state[8] - goal.yaw),
+        )
+    )
+    return bool(position_ok and velocity_ok and yaw_error <= yaw_tolerance)
 
 
 def commit_due_status(now: float, candidate: Trajectory, allowed_lateness: float) -> tuple:
@@ -567,6 +706,8 @@ class Px4CommandSequencer:
 PLANNER_PARAMETER_DEFAULTS = {
     "belief_topic": "/Odometry",
     "path_topic": "/ifds/local_path",
+    "mission_goal_topic": "/ifds/mission_goal",
+    "mission_goal_timeout": 0.0,
     "velocity_topic": "/uto/velocity",
     "px4_velocity_topic": "/fmu/out/vehicle_odometry",
     "px4_state_topic": "/uto/px4_status",
@@ -602,7 +743,9 @@ PLANNER_PARAMETER_DEFAULTS = {
     "sigma_count": 7,
     "control_check_points_per_region": 31,
     "gate_dense_points_per_region": 15,
-    "gate_rollout_endpoint_tolerance": 0.3,
+    "gate_rollout_endpoint_position_tolerance": 0.3,
+    "gate_rollout_endpoint_velocity_tolerance": 0.5,
+    "gate_rollout_endpoint_attitude_tolerance": 0.2,
     "path_tube_radius": 0.8,
     "sigma_path_tube_radius": 1.0,
     "initial_delay": 0.5,
@@ -612,12 +755,17 @@ PLANNER_PARAMETER_DEFAULTS = {
     "maximum_delay": 1.5,
     "validation_time": 0.02,
     "commit_margin": 0.08,
+    "commit_scheduling_margin": 0.02,
+    "latency_clip_min": 0.05,
+    "latency_clip_max": 1.5,
     "commit_guard": 0.05,
     "commit_position_tolerance": 0.5,
     "commit_velocity_tolerance": 0.7,
     "commit_attitude_tolerance": 0.25,
     "goal_position_tolerance": 0.2,
     "goal_velocity_tolerance": 0.2,
+    "goal_yaw_enabled": False,
+    "goal_yaw_tolerance": 0.2,
     "goal_dwell_time": 1.0,
     "terminal_position_tolerance": 0.3,
     "terminal_velocity_tolerance": 0.05,
@@ -685,6 +833,9 @@ def build_runtime_components(parameter: Callable[[str], object]) -> RuntimeCompo
         parameter("maximum_delay"),
         parameter("validation_time"),
         parameter("commit_margin"),
+        parameter("commit_scheduling_margin"),
+        parameter("latency_clip_min"),
+        parameter("latency_clip_max"),
     )
     buffer = TrajectoryBuffer()
     manager = CandidateManager(buffer, parameter("commit_guard"))
@@ -698,7 +849,15 @@ def build_runtime_components(parameter: Callable[[str], object]) -> RuntimeCompo
             path_tube=parameter("path_tube_radius"),
             sigma_path_tube=parameter("sigma_path_tube_radius"),
             dense_points_per_region=parameter("gate_dense_points_per_region"),
-            rollout_endpoint_tolerance=parameter("gate_rollout_endpoint_tolerance"),
+            rollout_endpoint_position_tolerance=parameter(
+                "gate_rollout_endpoint_position_tolerance"
+            ),
+            rollout_endpoint_velocity_tolerance=parameter(
+                "gate_rollout_endpoint_velocity_tolerance"
+            ),
+            rollout_endpoint_attitude_tolerance=parameter(
+                "gate_rollout_endpoint_attitude_tolerance"
+            ),
         )
     )
     return RuntimeComponents(nlp, adapter, delay, buffer, manager, gate)

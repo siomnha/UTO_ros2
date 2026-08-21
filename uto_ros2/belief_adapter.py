@@ -196,3 +196,48 @@ def resample_sigma_states(mean_state, rotation, covariance):
         mean_state[3:6],
         sanitize_covariance(covariance, reject_zero=False),
     )[0]
+
+
+def reconstruct_joint_tangent_from_sigma(sigma_states):
+    """Return SO(3) mean and full [p,v,attitude-tangent] covariance/deviations."""
+    from .math_utils import euler_to_rot
+
+    sigma = np.asarray(sigma_states, dtype=float)
+    mean, rotation, _ = reconstruct_belief_from_sigma(sigma)
+    deviations = np.empty((9, sigma.shape[1]))
+    deviations[:6] = sigma[:6] - mean[:6, None]
+    for index in range(sigma.shape[1]):
+        deviations[6:9, index] = so3_log(rotation.T @ euler_to_rot(sigma[6:9, index]))
+    deviations -= deviations.mean(axis=1, keepdims=True)
+    covariance = deviations @ deviations.T / sigma.shape[1]
+    return mean, rotation, (covariance + covariance.T) / 2.0, deviations
+
+
+def joint_sigma_process_update(sigma_states, pose_process_covariance):
+    """Add pose noise through a joint rank-six tangent update preserving vertex identity."""
+
+    sigma = np.asarray(sigma_states, dtype=float)
+    process = np.asarray(pose_process_covariance, dtype=float).reshape(6, 6)
+    mean, rotation, covariance, deviations = reconstruct_joint_tangent_from_sigma(sigma)
+    if np.max(np.abs(process)) == 0.0:
+        return sigma.copy(), mean, rotation, covariance
+    target = covariance.copy()
+    pose_indices = np.array([0, 1, 2, 6, 7, 8])
+    target[np.ix_(pose_indices, pose_indices)] += process
+    target = (target + target.T) / 2.0
+    values, vectors = np.linalg.eigh(target)
+    order = np.argsort(values)[::-1][:6]
+    values = np.maximum(values[order], 0.0)
+    factor = vectors[:, order] * np.sqrt(values)
+    # Right singular coordinates retain each propagated simplex vertex identity.
+    _, _, right = np.linalg.svd(deviations, full_matrices=True)
+    latent = np.sqrt(7.0) * right[:6]
+    updated_deviations = factor @ latent
+    updated_deviations -= updated_deviations.mean(axis=1, keepdims=True)
+    updated = np.empty_like(sigma)
+    updated[:3] = mean[:3, None] + updated_deviations[:3]
+    updated[3:6] = mean[3:6, None] + updated_deviations[3:6]
+    for index in range(7):
+        updated[6:9, index] = rot_to_euler(rotation @ so3_exp(updated_deviations[6:9, index]))
+    new_mean, new_rotation, new_covariance, _ = reconstruct_joint_tangent_from_sigma(updated)
+    return updated, new_mean, new_rotation, new_covariance

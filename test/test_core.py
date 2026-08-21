@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 from uto_ros2.belief_adapter import (
     BeliefStableDetector,
+    joint_sigma_process_update,
+    reconstruct_joint_tangent_from_sigma,
     StabilityConfig,
     reconstruct_belief_from_sigma,
     sanitize_covariance,
@@ -26,6 +28,8 @@ from uto_ros2.math_utils import (
 )
 from uto_ros2.planner_runtime import (
     CommandState,
+    CommitOutcome,
+    ExecutionDecision,
     DelayPredictor,
     FeasibilityGate,
     GateConfig,
@@ -34,6 +38,10 @@ from uto_ros2.planner_runtime import (
     PlanningRequest,
     Px4CommandSequencer,
     can_resume,
+    execution_decision,
+    goal_generation_changed,
+    mission_goal_input_valid,
+    mission_goal_satisfied,
     commit_continuity_errors,
     commit_due_status,
     offboard_control_flags,
@@ -89,8 +97,8 @@ def test_delay_uses_belief_absolute_time_and_process_noise_resamples():
     noisy_sigma, _, _, noisy_covariance = predictor.propagate(
         sigma, 10.0, 11.0, control_at, np.ones(9) * 0.02
     )
-    _, _, reconstructed_zero = reconstruct_belief_from_sigma(zero_sigma)
-    _, _, reconstructed_noisy = reconstruct_belief_from_sigma(noisy_sigma)
+    _, _, reconstructed_zero, _ = reconstruct_joint_tangent_from_sigma(zero_sigma)
+    _, _, reconstructed_noisy, _ = reconstruct_joint_tangent_from_sigma(noisy_sigma)
     assert queried_times[0] == 10.0
     assert max(queried_times) < 11.0
     assert np.allclose(reconstructed_zero, zero_covariance, atol=1e-8)
@@ -323,7 +331,7 @@ def test_dense_rollout_rejects_endpoint_mismatch():
     result["region_endpoint_sigma_physical"][0][:, 0] += 2.0
     checked = FeasibilityGate(GateConfig(terminal_position_tolerance=0.1)).check(result, request, 1)
     assert not checked.accepted
-    assert "rollout endpoint consistency" in checked.reasons
+    assert "rollout endpoint position" in checked.reasons
 
 
 def test_rejected_new_path_candidate_does_not_replace_active_generation():
@@ -382,3 +390,130 @@ def test_commit_timer_source_never_calls_solver():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert "solve" not in called and "_solve_request" not in called
+
+
+def test_commit_outcome_prioritizes_due_candidate_over_expired_active():
+    decision = execution_decision(CommitOutcome.COMMITTED, True, 0.0, False)
+    assert decision == ExecutionDecision.COMMIT
+    assert execution_decision(CommitOutcome.LATE, True, 0.0, False) == ExecutionDecision.SAFE_HOLD
+    assert (
+        execution_decision(CommitOutcome.REJECTED, True, 0.0, False) == ExecutionDecision.SAFE_HOLD
+    )
+    assert (
+        execution_decision(CommitOutcome.NONE, True, 0.0, False, True)
+        == ExecutionDecision.CONTINUE
+    )
+
+
+def test_completion_processing_cannot_publish_safe_hold_directly():
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("uto_ros2/uto_planner_node.py").read_text())
+    completion = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_on_solve_complete"
+    )
+    calls = {
+        node.func.attr
+        for node in ast.walk(completion)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "_enter_safe_hold" not in calls
+
+
+def test_dense_endpoint_uses_separate_so3_position_velocity_errors():
+    path = Polyline([[0, 0, 1], [1, 0, 1]])
+    sigma = np.repeat(np.array([[0, 0, 1, 0, 0, 0, 0, 0, np.deg2rad(179)]]).T, 7, axis=1)
+    request = PlanningRequest(
+        1,
+        "path",
+        1,
+        0,
+        1,
+        sigma,
+        sigma.mean(axis=1),
+        np.eye(3),
+        np.eye(9),
+        path.lookahead([0, 0, 1], 10, 0.2),
+        path,
+    )
+    result = make_gate_result(0.0)
+    result["region_endpoint_sigma_physical"][0][:] = sigma.T
+    result["region_endpoint_sigma_physical"][0][:, 8] = np.deg2rad(-179)
+    dense = FeasibilityGate(GateConfig())._dense_rollout(result, request)
+    assert dense[4] < 1e-8 and dense[5] < 1e-8
+    assert dense[6] == pytest.approx(np.deg2rad(2), abs=2e-3)
+    result["region_endpoint_sigma_physical"][0][:, 0] += 1.0
+    assert FeasibilityGate(GateConfig())._dense_rollout(result, request)[4] > 0.9
+    result["region_endpoint_sigma_physical"][0][:, 0] -= 1.0
+    result["region_endpoint_sigma_physical"][0][:, 3] += 1.0
+    assert FeasibilityGate(GateConfig())._dense_rollout(result, request)[5] > 0.9
+    result["region_endpoint_sigma_physical"][0][:, 3] -= 1.0
+    result["region_endpoint_sigma_physical"][0][:, 8] = 0.0
+    assert FeasibilityGate(GateConfig())._dense_rollout(result, request)[6] > 3.0
+
+
+def test_joint_sigma_update_preserves_cross_covariance_and_identity():
+    base, _ = sigma_states([0, 0, 1], np.eye(3), [0, 0, 0], np.diag([0.02] * 6))
+    # Inject correlated velocity using the existing latent pose/attitude vertices.
+    base[3] = 2.0 * (base[0] - base[0].mean())
+    base[4] = -1.5 * (base[7] - base[7].mean())
+    before_mean, _, before_cov, _ = reconstruct_joint_tangent_from_sigma(base)
+    unchanged, unchanged_mean, _, unchanged_cov = joint_sigma_process_update(base, np.zeros((6, 6)))
+    assert np.allclose(unchanged, base)
+    assert np.allclose(unchanged_cov, before_cov)
+    assert np.allclose(unchanged_mean, before_mean)
+    process = np.diag([0.005] * 6)
+    updated, updated_mean, _, updated_cov = joint_sigma_process_update(base, process)
+    assert np.all(np.isfinite(updated_cov)) and np.allclose(updated_cov, updated_cov.T)
+    assert np.allclose(updated_mean[:6], before_mean[:6], atol=1e-8)
+    assert np.linalg.norm(updated_cov[:3, 3:6]) > 1e-4
+    assert np.linalg.norm(updated_cov[6:9, 3:6]) > 1e-4
+    assert np.trace(updated_cov[np.ix_([0, 1, 2, 6, 7, 8], [0, 1, 2, 6, 7, 8])]) > np.trace(
+        before_cov[np.ix_([0, 1, 2, 6, 7, 8], [0, 1, 2, 6, 7, 8])]
+    )
+    assert np.max(np.ptp(updated[3:6], axis=1)) > 0
+
+
+def test_latency_estimator_cold_p90_clipping_and_margins():
+    predictor = DelayPredictor(0.5, 4, 0.1, 2.0, 0.02, 0.03, 0.01, 0.05, 1.0)
+    assert predictor.estimate_mode == "cold"
+    assert predictor.estimate() == pytest.approx(0.56)
+    predictor.record_latency(0.1)
+    predictor.record_latency(0.2)
+    predictor.record_latency(10.0)  # clipped to 1.0
+    assert predictor.estimate_mode == "steady_p90"
+    expected = np.percentile([0.1, 0.2, 1.0], 90) + 0.02 + 0.03 + 0.01
+    assert predictor.estimate() == pytest.approx(expected)
+    predictor.record_latency(0.8)  # includes a deterministic fake dense/queue delay
+    assert predictor.percentile90() >= 0.8
+    with pytest.raises(ValueError):
+        predictor.record_latency(float("nan"))
+    with pytest.raises(ValueError):
+        predictor.record_latency(-0.1)
+
+
+def test_explicit_mission_goal_not_local_path_endpoint_and_yaw_wrap():
+    belief = SimpleNamespace(
+        position=np.array([5.0, 0, 1]),
+        velocity=np.zeros(3),
+        mean_state=np.array([5.0, 0, 1, 0, 0, 0, 0, 0, np.deg2rad(179)]),
+    )
+    mission_goal = SimpleNamespace(position=np.array([10.0, 0, 1]), yaw=np.deg2rad(-179))
+    assert not mission_goal_satisfied(belief, mission_goal, 0.2, 0.2, False, 0.1)
+    belief.position = mission_goal.position.copy()
+    belief.mean_state[:3] = belief.position
+    assert mission_goal_satisfied(belief, mission_goal, 0.2, 0.2, True, np.deg2rad(3))
+    assert not mission_goal_satisfied(belief, mission_goal, 0.2, 0.2, True, np.deg2rad(1))
+
+
+def test_mission_goal_validation_and_generation_semantics():
+    assert mission_goal_input_valid(9.0, 10.0, "map", "map", [1, 2, 3], 0.0)
+    assert not mission_goal_input_valid(0.0, 10.0, "map", "map", [1, 2, 3], 0.0)
+    assert not mission_goal_input_valid(9.0, 10.0, "odom", "map", [1, 2, 3], 0.0)
+    assert not mission_goal_input_valid(1.0, 10.0, "map", "map", [1, 2, 3], 1.0)
+    old = SimpleNamespace(generation="1,2,3,0")
+    assert not goal_generation_changed(old, "1,2,3,0")
+    assert goal_generation_changed(old, "4,5,6,0")

@@ -25,17 +25,19 @@ uto_ros2/
 ## Planner双timer和线程模型
 
 * **Planning timer**：使用`replan_rate`（global 0.75 Hz，online 1.5 Hz），只决定是否replan、生成delay-compensated request和提交latest-wins worker。
-* **Commit/safety timer**：默认`commit_check_rate=50 Hz`，消费worker completion queue、推进mission state、执行freshness/goal检查、gate admission、candidate due/continuity/late检查、atomic commit和轻量diagnostics。它不调用NLP build/solve。
+* **Commit/safety timer**：默认`commit_check_rate=50 Hz`，消费worker completion queue、推进mission state、执行freshness/goal检查、candidate due/continuity/late检查、atomic commit和轻量diagnostics。它不调用NLP build/solve或dense gate。
 
-Worker线程是唯一CasADi/IPOPT owner，只set parameters、solve、extract并把immutable `CompletionEvent`放入线程安全queue。所有state、candidate、publisher更新都在ROS timer线程完成。First solve使用不可替换提交，避免cold solve期间重复first request；普通solve仍为latest-wins，stale completion只丢弃。
+Worker线程是唯一CasADi/IPOPT owner，负责set parameters、solve、extract和与ROS无关的dense gate，再把immutable `CompletionEvent`放入线程安全queue。所有state、candidate、publisher更新都在ROS timer线程完成。First solve使用不可替换提交，避免cold solve期间重复first request；普通solve仍为latest-wins，stale completion只丢弃。当前节点明确以`SingleThreadedExecutor`为支持基线。
 
-Candidate允许的commit lateness由`allowed_commit_lateness`限制；超过阈值会拒绝，避免从trajectory中间开始。通过gate的candidate只留在planner本地，到commit时用最新belief检查position、velocity和SO(3) geodesic attitude error，成功后才发布给bridge。Global mode的active path generation也只在成功commit后更新。
+Candidate允许的commit lateness由`allowed_commit_lateness`限制；超过阈值会拒绝，避免从trajectory中间开始。每次高频tick先drain completion、取得一致snapshot，再优先处理due candidate；仅在没有成功commit时才判定旧active是否过期。一个tick只会选择`commit / continue / safe hold / goal reached`之一，避免同周期先hold再发trajectory。通过gate的candidate只留在planner本地，到commit时用最新belief检查position、velocity和SO(3) geodesic attitude error，成功后才发布给bridge。Global mode的active path generation也只在成功commit后更新。
 
 ## Belief、delay和时间域
 
 FAST-LIO `/Odometry`读取position、quaternion、ROS timestamp和完整6×6 position/attitude-tangent covariance，保留cross terms并执行finite、all-zero、PSD、eigen-floor和inflation检查。Stable detector使用position Euclidean变化、`Log(R_previousᵀR_current)` attitude变化及covariance变化，所以`179°→-179°`不会被误判为358°跳变。Conversion、frame、quaternion、covariance或velocity失败会立即清除stable状态。
 
-Delay从belief timestamp开始，以相同绝对时钟查询active controls并用RK4传播七条sigma trajectories。SO(3) UT后只向6D position/attitude tangent covariance加入`Q_delay Δt`；重新注入该spread时保留动力学传播产生的每条sigma velocity deviation，并保持mean velocity不变。`commit_time < belief_stamp`或clock非finite会拒绝request。
+Delay从belief timestamp开始，以相同绝对时钟查询active controls并用RK4传播七条sigma trajectories。传播后在`[position, velocity, Log(R_mean^T R_i)]`的9维联合tangent space计算均值、covariance和原始simplex vertex identity。`Q=0`时原始七条trajectory完全不重采样；`Q>0`时只把规定的pose process-noise block加入联合covariance，并用原latent vertex basis作PSD factor update，因此保留动力学产生的position–velocity及attitude–velocity cross terms，而不是按新旧数组索引拼接velocity。`commit_time < belief_stamp`或clock非finite会拒绝request。
+
+Delay历史记录的是实际admission latency，而不只是IPOPT时间：request enqueue → worker queue → build/parameter prepare → IPOPT → extraction → dense gate → completion queue consumption；成功commit后另记request-to-commit。窗口满前用`cold_start_delay`，之后使用固定窗口、先按`latency_clip_min/max`裁剪的P90，再加入`validation_time + commit_margin + commit_scheduling_margin`并限制到`minimum_delay/maximum_delay`。Diagnostics分别发布`queue_time`、`nlp_prepare_time`、`ipopt_solve_time`、`extraction_time`、`dense_gate_time`、`worker_total_time`、`completion_queue_time`、`request_to_commit_time`、估计delay及cold/P90模式。
 
 PX4 `VehicleOdometry.timestamp_sample`存在时优先使用，否则使用`timestamp`。`px4_velocity_time_mode=offset`显式估计PX4→ROS offset并监测offset跳变；`ros`模式要求timestamp已在ROS `/clock`域。超过`source_clock_tolerance`的变化使velocity invalid。Diagnostics发布belief/path/velocity age和velocity clock offset。IFDS path的header stamp必须非零，且每次有效dynamic update必须更新ROS timestamp。
 
@@ -45,11 +47,13 @@ Velocity先NED→ENU，再按`velocity_frame_alignment_mode=identity|yaw_offset`
 
 默认固定graph为2 regions × 5 LGR nodes、7 shared-control sigma trajectories、10 references。NLP包含normalized LGR dynamics、region continuity、dense polynomial control bounds、velocity/attitude bounds、path tracking、terminal mean/covariance/velocity、effort和smoothness。Startup-only参数包括regions、nodes、sigma、references、control checks和scales；在线只`set_value`，`build_count`保持1。
 
-Admission先检查真实LGR residual和collocation output，再独立执行每region默认15点RK4 rollout：用优化后的LGR control polynomial做barycentric interpolation，从七条commit sigma initial states传播，检查finite、dense mean/all-sigma path tube、velocity、roll/pitch、control bounds以及rollout/LGR endpoint consistency。Diagnostics发布所有dense maxima和endpoint error。Dense path tube仍不是collision checking。
+Admission先检查真实LGR residual和collocation output，再独立执行每region默认15点RK4 rollout：用优化后的LGR control polynomial做barycentric interpolation，从七条commit sigma initial states传播，检查finite、dense mean/all-sigma path tube、velocity、roll/pitch、control bounds以及rollout/LGR endpoint consistency。Endpoint一致性拆成position Euclidean error（m）、velocity Euclidean error（m/s）和`Log(R_LGR^T R_rollout)` SO(3) geodesic error（rad），对应三个独立参数与diagnostic，避免Euler `+pi/-pi`误报。Dense path tube仍不是collision checking。
 
-## GOAL_REACHED和hold
+## 显式mission goal、GOAL_REACHED和hold
 
-IFDS polyline终点是当前goal。Active trajectory结束后，最新belief必须连续`goal_dwell_time`满足position和velocity tolerance才进入`GOAL_REACHED`；否则trajectory过期进入`SAFE_HOLD`，不能误报goal。Goal reached后停止普通replanning并保持bridge terminal hold；开始新mission采用保守规则：重启planner/mission或显式重新启动流程，不因新path自动离开goal。
+`/ifds/local_path`只提供滚动lookahead，末点绝不是全局任务终点。IFDS须用`geometry_msgs/PoseStamped`在`/ifds/mission_goal`为每个任务发布一次显式goal；timestamp必须非零、frame必须等于planning frame、position/orientation必须finite。默认`mission_goal_timeout=0`表示收到后持久有效；正值才启用freshness timeout。内容generation变化会清除旧dwell，重复发布相同goal或滚动local path不会重置它。
+
+Active/terminal trajectory结束后，最新belief必须连续`goal_dwell_time`满足显式goal的position、velocity，以及可选的wrapped-yaw tolerance，才进入`GOAL_REACHED`；否则trajectory过期进入`SAFE_HOLD`。Goal reached后停止普通replanning并保持bridge terminal hold。新goal到达只设置保守restart-pending，需调用`/uto/resume`且PX4/hold/fresh data健康后才开始新任务。
 
 Trajectory JSON (`uto_trajectory/v1`)验证time/state/control/covariance shape、finite和monotonic。Yaw插值先unwrap再wrap，避免`+π/-π`走长路径。正常结束hold最终trajectory position/yaw；emergency hold保持最后实际安全setpoint，不回起飞点，不外推过期trajectory。
 
@@ -74,13 +78,14 @@ IFDS必须为path-only，关闭IFDS/MAVROS direct setpoint。IFDS和UTO必须使
 |---|---|
 | FAST-LIO belief | `/Odometry` |
 | IFDS path | `/ifds/local_path` |
+| IFDS explicit mission goal | `/ifds/mission_goal` (`geometry_msgs/PoseStamped`) |
 | Executable trajectory | `/uto/trajectory` |
 | Emergency execution command | `/uto/execution_command` |
 | Diagnostics / PX4 state | `/uto/diagnostics`, `/uto/px4_status` |
 | Resume | `/uto/resume` (`std_srvs/Trigger`) |
 | PX4 topics | 全部在`gazebo_harmonic_px4.yaml`参数化 |
 
-`SAFE_HOLD`只有PX4 connected/no-failsafe/hold-ready、belief重新稳定、velocity/path fresh时才能通过resume；FAULT不能普通resume。
+IFDS契约是：(1) 持续发布有新ROS timestamp的local path；(2) 每个任务或全局goal变化时发布mission goal；(3) 绝不直接向PX4/MAVROS发布setpoint。`SAFE_HOLD`只有PX4 connected/no-failsafe/hold-ready、belief重新稳定、velocity/path fresh时才能通过resume；FAULT不能普通resume。
 
 ## Build和运行
 
@@ -108,6 +113,8 @@ colcon test --packages-select uto_ros2 && colcon test-result --verbose
 Pure tests覆盖SO(3)、yaw wrap、delay velocity dispersion/process noise、dense rollout、dual-rate commit helpers、completion queue、goal dwell、global commit generation、trajectory interpolation、PX4 control levels和旧模块检查。Solver test包含小型1×2×7和默认2×5×7的build/two-solve/reuse/residual/covariance/timing检查。
 
 ROS optional test在依赖齐全时实际初始化rclpy并构造planner/bridge，检查独立planning/commit timers和默认PX4层级；它仍不是完整fake-topic状态序列或Gazebo验证。若目标CI需要完整消息闭环，应继续加入匹配该PX4版本的fake publishers/ACK fixture。当前README不声称Gazebo、PX4 SITL或未执行tests已经通过。
+
+本次提交所处容器没有NumPy、CasADi、ROS 2、`px4_msgs`、Gazebo或`colcon`：Python AST/bytecode和YAML重复键检查已执行；core/solver pytest在collection阶段因缺少NumPy而未运行，ROS optional test按设计skip，SITL未运行。必须在依赖完整的目标workspace重新执行上述全部命令，不能把这些环境阻塞视为功能通过。
 
 ## Real-flight前
 
