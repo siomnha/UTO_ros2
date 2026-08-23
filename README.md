@@ -18,7 +18,7 @@ setpoint. `uto_planner` is the only local trajectory optimizer, and
 
 ## IFDS–UTO integration
 
-The runtime `uto_ros2/ifds_core.py` is a byte-for-byte migration of the original
+The runtime `ros2_packages/uto_ros2/uto_ros2/ifds_core.py` is a byte-for-byte migration of the original
 modulation-based IFDS core from `IFDS_integration_node/ifds_ros2`. It retains
 superellipsoid gamma/normal/tangent modulation, planar corridor walls, `rho0`,
 `sigma0`, `delta_g`, `alpha_deg`, shape following, wall gains, dynamic and
@@ -27,8 +27,10 @@ not the former sphere/detour substitute.
 
 The nested original ROS package is retained as a non-runtime reference and has a
 `COLCON_IGNORE`; its historical carrot/setpoint wrapper cannot be discovered by
-colcon. Gazebo plugins, the RGL Livox converter, and world SDF files remain as
-simulation support packages, not members of the online control chain.
+colcon. The three discoverable runtime packages are standard siblings under
+`ros2_packages/`: `uto_ros2`, `ifds_gz_plugins`, and `rgl_livox_converter`.
+Gazebo plugins and the RGL Livox converter are simulation support packages, not
+additional flight-command owners.
 
 ### Topic ownership
 
@@ -58,7 +60,9 @@ is rejected (geometry is never relabelled).
 
 Path and valid status travel on different DDS topics, so UTO caches both by the
 exact `path_stamp_ns` and activates them atomically in either arrival order.
-Unmatched items expire after `path_pair_timeout` (0.20 s). An incomplete refresh
+Unmatched items expire after `path_pair_timeout` (0.20 s) and produce an
+`IFDS_PATH_PAIR_TIMEOUT` warning containing the expired stamp and remaining cache
+counts. An incomplete refresh
 does not invalidate a still-fresh active pair. An explicit invalid status fails
 closed immediately: pending candidates are discarded; execution states request
 `SAFE_HOLD`.
@@ -70,6 +74,21 @@ resampled (`path_resample_spacing=0.10 m`); generation changes when maximum or R
 geometry error exceeds `path_geometry_change_threshold=0.05 m`, or goal/obstacle
 context changes. UTO uses the paired status generation; its geometry hash is only
 a fallback helper.
+
+### Status and terminal semantics
+
+| Status/command | Meaning |
+|---|---|
+| `NEW_GOAL_PENDING` | Invalidates the previous path, candidate, and request generation while IFDS replans. Active execution changes to `HOLD_CURRENT`. |
+| `valid=true, terminal=false` | Normal Path status; requires stamp pairing with a `nav_msgs/Path`. |
+| `valid=false, terminal=false` | Genuine planning failure; fails closed and may produce `SAFE_HOLD`. |
+| `ALREADY_AT_MISSION_GOAL`, `terminal=true` | No zero-length Path is required; UTO clears old planning work and performs fresh-belief goal dwell from hold. |
+| `HOLD_CURRENT` | Non-fault hold at the last actually issued setpoint during a mission transition. |
+| `SAFE_HOLD` | Fault/safety fallback; distinct from normal terminal hold. |
+
+IFDS publishes `NEW_GOAL_PENDING` for every newly accepted `/ifds/goal` before
+planning. Mission-goal and status topics may arrive in either order: neither can
+reuse an old Path because the pending status increments UTO's request generation.
 
 ### Exact goal and zero-length mission
 
@@ -91,8 +110,13 @@ Original `known_obstacles*.yaml` files are also installed. They support `wall` a
 `superellipsoid` entries with `axes`, `exponents`, `dynamic`, and motion
 `start/end/velocity`. SDF ellipsoid `radii` are semi-axes and therefore correspond
 directly to YAML `axes` (not full box dimensions). In simulation,
-`validate_world_consistency=true` checks names, centers, radii, dynamic
-classification, and plugin motion parameters; mismatch prevents a valid path.
+`validate_world_consistency=true` checks obstacle names in both directions,
+centers, radii, dynamic classification, walls, and plugin motion parameters;
+mismatch prevents a valid path. For a wall with axis `i`, SDF center `c_i`, size
+`d_i`, and YAML `inside_sign`, its inner boundary is
+`c_i + inside_sign*d_i/2`. The validator also rejects non-static walls, bad box
+coverage, duplicate/extra/missing obstacle names, relative poses, and rotated
+obstacle models rather than silently comparing coordinates in the wrong frame.
 Use `allow_empty_obstacles:=true` only for an explicit obstacle-free test.
 
 | `gnss_denied` | IFDS mean subscription |
@@ -120,13 +144,48 @@ from every machine.
 ## Build and verification
 
 ```bash
-python3 -m compileall uto_ros2 launch test
+python3 -m compileall .
 python3 -m pytest -q
 source /opt/ros/jazzy/setup.bash
-rosdep install --from-paths . -yi
-colcon build --symlink-install --packages-select uto_ros2
-colcon test --packages-select uto_ros2
+colcon list
+rosdep install --from-paths ros2_packages -yi
+colcon build --symlink-install \
+  --packages-select ifds_gz_plugins rgl_livox_converter uto_ros2
+colcon test \
+  --packages-select ifds_gz_plugins rgl_livox_converter uto_ros2
 colcon test-result --verbose
+```
+
+After sourcing `install/setup.bash`, verify plugin installation and automatic
+Gazebo discovery:
+
+```bash
+ros2 pkg prefix ifds_gz_plugins
+find "$(ros2 pkg prefix ifds_gz_plugins)" -name 'libifds_obstacle_path.so'
+find "$(ros2 pkg prefix ifds_gz_plugins)" -name 'libifds_obstacle_oscillator.so'
+echo "$GZ_SIM_SYSTEM_PLUGIN_PATH"
+```
+
+The environment hook prepends the package's `lib` directory; a manual export is
+only a troubleshooting fallback. Three distinct validation levels exist:
+
+1. ordinary pure tests parse and compare YAML/SDF contracts;
+2. build verification checks both plugin binaries and the environment hook;
+3. `UTO_RUN_GAZEBO_TESTS=1 python3 -m pytest -m gazebo` launches the dynamic
+   world and observes `dynamic_obstacle_3` motion. Missing Gazebo causes an
+   explicit skip, not a pass.
+
+The required simulation matrix is: global + GNSS supported, global + GNSS
+denied, online + GNSS supported, and online + GNSS denied. `gnss_denied` only
+selects the IFDS mean-position source; `uto_belief_topic` independently selects
+UTO's mean/covariance source. GNSS-supported operation therefore does not imply
+that raw GNSS odometry satisfies UTO's 6-D covariance contract.
+
+```bash
+ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=global gnss_denied:=false uto_belief_topic:=/fusion/odometry
+ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=global gnss_denied:=true
+ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online gnss_denied:=false uto_belief_topic:=/fusion/odometry
+ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online gnss_denied:=true
 ```
 
 Pure tests cover the original-core regression oracle, no-obstacle/wall/

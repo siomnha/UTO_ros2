@@ -1,0 +1,129 @@
+header:
+  frame_id: map
+
+obstacles:
+  - name: corridor_wall_left
+    type: wall
+    axis: y
+    boundary: 2.425
+    inside_sign: -1
+
+  - name: corridor_wall_right
+    type: wall
+    axis: y
+    boundary: -2.425
+    inside_sign: 1
+
+  - name: corridor_wall_start
+    type: wall
+    axis: x
+    boundary: -3.0
+    inside_sign: 1
+
+  - name: corridor_wall_end
+    type: wall
+    axis: x
+    boundary: 40.425
+    inside_sign: -1
+
+  - name: static_obstacle_1
+    type: superellipsoid
+    center: [3.32173, -1.210448, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: static_obstacle_2
+    type: superellipsoid
+    center: [5.19162, 1.03199, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: static_obstacle_3
+    type: superellipsoid
+    center: [9.5971, -0.991291, 1.0]
+    axes: [0.9, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: static_obstacle_4
+    type: superellipsoid
+    center: [16.6517, 0.03953, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: static_obstacle_5
+    type: superellipsoid
+    center: [22.5281, -1.287008, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: static_obstacle_6
+    type: superellipsoid
+    center: [22.5815, 1.86, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: static_obstacle_7
+    type: superellipsoid
+    center: [26.5002, 0.75131, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: static_obstacle_8
+    type: superellipsoid
+    center: [30.2832, 0.06, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: static_obstacle_9
+    type: superellipsoid
+    center: [36.0874, 0.92218, 1.0]
+    axes: [0.9, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
+
+  - name: dynamic_obstacle_3
+    type: superellipsoid
+    center: [13.0, 1.0, 0.9]
+    axes: [0.25, 0.25, 0.9]
+    exponents: [1.0, 1.0, 1.0]
+    dynamic: true
+    motion:
+      type: ping_pong
+      start: [13.0, 1.0, 0.9]
+      end: [13.0, -1.0, 0.9]
+      velocity: 0.5
+
+  - name: dynamic_obstacle_5
+    type: superellipsoid
+    center: [18.5, -1.5, 0.9]
+    axes: [0.25, 0.25, 0.9]
+    exponents: [1.0, 1.0, 1.0]
+    dynamic: true
+    motion:
+      type: ping_pong
+      start: [18.5, -1.5, 0.9]
+      end: [18.5, 1.5, 0.9]
+      velocity: 0.5
+
+  - name: dynamic_obstacle_6
+    type: superellipsoid
+    center: [24.0, -1.5, 0.9]
+    axes: [0.25, 0.25, 0.9]
+    exponents: [1.0, 1.0, 1.0]
+    dynamic: true
+    motion:
+      type: ping_pong
+      start: [24.0, -1.5, 0.9]
+      end: [27.0, -1.5, 0.9]
+      velocity: 0.5
+
+  - name: dynamic_obstacle_8
+    type: superellipsoid
+    center: [34.0, -1.5, 0.9]
+    axes: [0.25, 0.25, 0.9]
+    exponents: [1.0, 1.0, 1.0]
+    dynamic: true
+    motion:
+      type: ping_pong
+      start: [34.0, -1.5, 0.9]
+      end: [34.0, 1.5, 0.9]
+      velocity: 0.5
