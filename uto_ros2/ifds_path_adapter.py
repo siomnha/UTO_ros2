@@ -1,6 +1,8 @@
 import hashlib
 import numpy as np
 
+from .ifds_core import Obstacle, PlanarWall
+
 
 class Polyline:
     def __init__(self, points):
@@ -44,3 +46,27 @@ def path_generation(stamp_or_points, points=None, resolution=0.05):
         raise ValueError("path generation geometry must be finite")
     quantized = np.rint(geometry / resolution).astype(np.int64)
     return hashlib.sha256(quantized.tobytes()).hexdigest()[:16]
+
+
+def append_exact_ifds_goal(planner, waypoints, goal):
+    """Append the exact goal only when original IFDS wall/gamma tests permit it."""
+    points = np.asarray(waypoints, dtype=float).reshape(-1, 3)
+    goal = np.asarray(goal, dtype=float).reshape(3)
+    if np.linalg.norm(points[-1] - goal) <= 1e-10:
+        return True, points, "PATH_REACHES_MISSION_GOAL"
+    distance = float(np.linalg.norm(goal - points[-1]))
+    step = max(planner.config.cruise_speed * planner.config.dt, 0.02)
+    count = max(2, int(np.ceil(distance / step)) + 1)
+    for point in np.linspace(points[-1], goal, count)[1:]:
+        for obstacle in planner.obstacles:
+            if isinstance(obstacle, PlanarWall):
+                if obstacle.inside_sign * (point[obstacle.axis] - obstacle.boundary) < 0.0:
+                    return False, points, f"EXACT_GOAL_SEGMENT_OUTSIDE_WALL:{obstacle.name}"
+            elif isinstance(obstacle, Obstacle):
+                gamma, _, _, _ = obstacle.gamma_normal_tangent(
+                    point, planner.config.alpha_deg, planner.plan_time_s,
+                    planner.config.dynamic_obstacles,
+                )
+                if not np.isfinite(gamma) or gamma <= planner.config.min_gamma:
+                    return False, points, f"EXACT_GOAL_SEGMENT_UNSAFE:{obstacle.name}"
+    return True, np.vstack((points, goal)), "PATH_REACHES_MISSION_GOAL"

@@ -4,6 +4,7 @@ uto_planner:
     belief_topic: /Odometry
     path_topic: /ifds/local_path
     path_status_topic: /ifds/path_status
+    path_pair_timeout: 0.20
     path_generation_resolution: 0.05
     mission_goal_topic: /ifds/mission_goal
     mission_goal_timeout: 0.0

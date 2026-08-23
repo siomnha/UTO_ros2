@@ -10,6 +10,8 @@ setup(
         ("share/uto_ros2", ["package.xml"]),
         ("share/uto_ros2/launch", glob("launch/*.launch.py")),
         ("share/uto_ros2/config", glob("config/*.yaml")),
+        ("share/uto_ros2/worlds", glob("IFDS_integration_node/world_sdf/*.sdf") +
+         glob("IFDS_integration_node/ifds_ros2/worlds/*.sdf")),
     ],
     install_requires=["setuptools", "numpy"],
     zip_safe=True,

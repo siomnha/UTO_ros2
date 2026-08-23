@@ -16,7 +16,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from .belief_adapter import Belief
 from .ifds_path_adapter import Polyline, path_generation
-from .ifds_core import PathStatus, status_matches_path
+from .ifds_contract import PathPairCache, PathStatus, status_matches_path
 from .math_utils import align_enu_velocity, ned_to_enu
 from .planner_runtime import (
     CommitOutcome,
@@ -75,6 +75,9 @@ class UTOPlannerNode(Node):
         self.belief_stable = False
         self.path = None
         self.path_status = None
+        self.path_pairs = PathPairCache()
+        self.path_pair_timeouts = 0
+        self.ifds_terminal_ready = False
         self.mission_goal = None
         self.goal_restart_pending = False
         self.velocity = None
@@ -276,7 +279,7 @@ class UTOPlannerNode(Node):
         ]
         try:
             stamp_ns = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
-            path = {
+            pending_path = {
                 "stamp": stamp,
                 "stamp_ns": stamp_ns,
                 "received": self._now(),
@@ -289,7 +292,9 @@ class UTOPlannerNode(Node):
             self._publish_diagnostics(str(exception), "ERROR")
             return
         with self.lock:
-            self.path = path
+            pair = self.path_pairs.add_path(stamp_ns, pending_path, self._now())
+            if pair is not None:
+                self._activate_path_pair(pair)
 
     def _on_path_status(self, message: String) -> None:
         try:
@@ -297,14 +302,37 @@ class UTOPlannerNode(Node):
         except (ValueError, TypeError, json.JSONDecodeError) as exception:
             self._invalidate_ifds_path(f"INVALID_PATH_STATUS:{exception}")
             return
-        with self.lock:
-            path_matches = self.path is not None and self.path["stamp_ns"] == status.path_stamp_ns
-            self.path_status = status
         if not status.valid:
+            if status.reason == "ALREADY_AT_MISSION_GOAL":
+                with self.lock:
+                    self.ifds_terminal_ready = True
+                    self.path_pairs.clear()
+                    self.buffer.discard_candidate()
+                self._publish_diagnostics(status.reason, "INFO")
+                return
             self._invalidate_ifds_path(status.reason)
             return
-        if not path_matches:
-            self._invalidate_ifds_path("PATH_STATUS_STAMP_MISMATCH")
+        with self.lock:
+            pair = self.path_pairs.add_status(status, self._now())
+            if pair is not None:
+                self._activate_path_pair(pair)
+
+    def _activate_path_pair(self, pair) -> None:
+        """Activate one matched Path/status pair atomically while holding ``lock``."""
+        path = pair.path
+        path["generation"] = (
+            f"ifds:{pair.status.goal_generation}:"
+            f"{pair.status.obstacle_generation}:{pair.status.path_generation}"
+        )
+        path["status"] = pair.status
+        self.path = path
+        self.path_status = pair.status
+        self.ifds_terminal_ready = False
+
+    def _expire_path_pairs(self, now: float) -> None:
+        with self.lock:
+            expired = self.path_pairs.expire(now, self._parameter("path_pair_timeout"))
+            self.path_pair_timeouts += len(expired)
 
     def _invalidate_ifds_path(self, reason: str) -> None:
         now = self._now()
@@ -315,10 +343,12 @@ class UTOPlannerNode(Node):
                 0,
                 previous.path_generation if previous else 0,
                 previous.goal_generation if previous else 0,
+                previous.obstacle_generation if previous else 0,
                 now,
                 now,
                 reason or "NO_VALID_IFDS_PATH",
             )
+            self.path_pairs.clear()
             self.path = None
             self.buffer.discard_candidate()
             self.request_generation += 1
@@ -417,6 +447,7 @@ class UTOPlannerNode(Node):
         for event in self.worker.drain_completions():
             self._on_solve_complete(event.request, event.result, event.stale)
         snapshot = self._snapshot()
+        self._expire_path_pairs(snapshot.now)
         self._update_mission_state(snapshot)
         if self.state in (PlannerState.FAULT, PlannerState.SAFE_HOLD):
             self._publish_diagnostics()
@@ -471,7 +502,7 @@ class UTOPlannerNode(Node):
     def _path_fresh(self, snapshot: PlannerSnapshot) -> bool:
         if snapshot.path is None:
             return False
-        status = self.path_status
+        status = snapshot.path.get("status") if snapshot.path else None
         if (
             status is None
             or not status.valid
@@ -718,7 +749,7 @@ class UTOPlannerNode(Node):
         if (
             snapshot.belief is None
             or goal is None
-            or self.buffer.active is None
+            or (self.buffer.active is None and not self.ifds_terminal_ready)
             or not self._terminal_goal_data_fresh(snapshot)
         ):
             return False
@@ -735,7 +766,14 @@ class UTOPlannerNode(Node):
         )
 
     def _update_goal(self, snapshot: PlannerSnapshot) -> None:
-        if self.state not in (PlannerState.EXECUTING, PlannerState.REPLANNING):
+        goal_states = (
+            PlannerState.HOLD,
+            PlannerState.WAIT_BELIEF_STABLE,
+            PlannerState.WAIT_IFDS_INITIAL_PATH,
+            PlannerState.EXECUTING,
+            PlannerState.REPLANNING,
+        )
+        if self.state not in goal_states:
             self.goal_since = None
             return
         if not self._terminal_goal_data_fresh(snapshot) or snapshot.px4.get("failsafe"):
@@ -837,6 +875,12 @@ class UTOPlannerNode(Node):
             "ifds_path_status_valid": self.path_status.valid if self.path_status else None,
             "ifds_path_status_reason": self.path_status.reason if self.path_status else None,
             "ifds_path_valid_until": self.path_status.valid_until if self.path_status else None,
+            "ifds_obstacle_generation": (
+                self.path_status.obstacle_generation if self.path_status else None
+            ),
+            "path_pair_timeout_count": self.path_pair_timeouts,
+            "pending_path_count": len(self.path_pairs.paths),
+            "pending_path_status_count": len(self.path_pairs.statuses),
             "velocity_age": (
                 self._now() - self.velocity_stamp if self.velocity is not None else None
             ),

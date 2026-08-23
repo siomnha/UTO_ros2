@@ -29,7 +29,7 @@ ifds_planner:
     alpha_deg: 0.0
     shape_following: false
     min_gamma: 1.02
-    dynamic_obstacles: false
+    dynamic_obstacles: true
     velocity_mode: normal
     optimizer_mode: 0
     local_optimizer_period_steps: 5

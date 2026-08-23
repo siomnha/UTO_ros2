@@ -1,6 +1,5 @@
-"""Strict path-only IFDS ROS node for the IFDS -> UTO control chain."""
+"""Path-only ROS wrapper around the original modulation-based IFDS planner."""
 
-import json
 from pathlib import Path as FilePath
 
 import numpy as np
@@ -12,135 +11,115 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
-from visualization_msgs.msg import MarkerArray
 import yaml
 
-from .ifds_core import (
+from .ifds_contract import (
     PathStatus,
-    SphereObstacle,
+    SemanticPathGeneration,
     multiply_quaternions,
-    plan_ifds_path,
+    selected_odometry_topic,
     transform_position,
+    validate_obstacle_world,
 )
+from .ifds_core import IFDSConfig, IFDSPlanner, obstacle_from_mapping
+from .ifds_path_adapter import append_exact_ifds_goal
 
 
 class IFDSPlannerNode(Node):
-    """Consume mean pose/goal/obstacles and publish paths; never flight setpoints."""
+    """Publish IFDS paths and contracts; this node never publishes flight setpoints."""
 
     def __init__(self) -> None:
         super().__init__("ifds_planner")
         defaults = {
-            "use_sim_time": True,
-            "planner_only": True,
-            "planning_frame": "map",
-            "odometry_topic": "/Odometry",
-            "goal_topic": "/ifds/goal",
-            "mission_goal_topic": "/ifds/mission_goal",
-            "path_topic": "/ifds/local_path",
-            "path_status_topic": "/ifds/path_status",
-            "obstacle_topic": "/ifds/obstacles",
-            "obstacle_yaml": "",
-            "obstacle_frame": "map",
-            "planning_rate": 2.0,
-            "path_validity_duration": 0.8,
-            "target_threshold": 0.05,
-            "obstacle_clearance": 0.25,
-            "tf_timeout": 0.1,
-            "gnss_denied": True,
-            "dynamic_obstacles": False,
+            "use_sim_time": True, "planner_only": True, "frame_id": "map",
+            "gnss_denied": True, "gnss_odom_topic": "/x500/gnss/odometry",
+            "fast_lio_odom_topic": "/Odometry", "goal_topic": "/ifds/goal",
+            "mission_goal_topic": "/ifds/mission_goal", "path_topic": "/ifds/local_path",
+            "path_status_topic": "/ifds/path_status", "obstacle_updates_topic": "/ifds/obstacles",
+            "obstacles_yaml": "", "planning_rate_hz": 2.0, "path_validity_duration": 0.8,
+            "tf_timeout": 0.1, "allow_empty_obstacles": False,
+            "validate_world_consistency": False, "world_sdf": "",
+            "path_geometry_change_threshold": 0.05, "path_resample_spacing": 0.10,
+            "rho0": 2.5, "sigma0": 0.01, "cruise_speed": 2.0, "dt": 0.1,
+            "max_iterations": 1000, "target_threshold": 0.05, "delta_g": 2.0,
+            "alpha_deg": 0.0, "shape_following": False, "min_gamma": 1.02,
+            "dynamic_obstacles": False, "velocity_mode": "normal", "optimizer_mode": 0,
+            "local_optimizer_period_steps": 5, "wall_modulation_gain": 1.5,
+            "wall_influence_distance": 1.0,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
         if not self.get_parameter("planner_only").value:
-            raise RuntimeError("this integration requires planner_only=true")
-        self.frame = str(self.get_parameter("planning_frame").value)
+            raise RuntimeError("uto_ros2 requires IFDS planner_only=true")
+        self.frame = str(self.get_parameter("frame_id").value)
         self.position = None
         self.goal = None
         self.goal_orientation = None
         self.goal_generation = 0
-        self.path_generation = 0
+        self.obstacle_generation = 0
         self.replan_requested = False
         self.obstacles = []
-        self.obstacles_valid = True
+        self.map_valid = False
+        self.semantic_generation = SemanticPathGeneration(
+            self.get_parameter("path_geometry_change_threshold").value,
+            self.get_parameter("path_resample_spacing").value,
+        )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        goal_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        goal_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.goal_pub = self.create_publisher(PoseStamped, self._p("mission_goal_topic"), goal_qos)
+        self.path_pub = self.create_publisher(Path, self._p("path_topic"), 10)
+        self.status_pub = self.create_publisher(String, self._p("path_status_topic"), 10)
+        odom_topic = selected_odometry_topic(
+            bool(self._p("gnss_denied")), str(self._p("gnss_odom_topic")),
+            str(self._p("fast_lio_odom_topic")),
         )
-        self.goal_pub = self.create_publisher(
-            PoseStamped, self.get_parameter("mission_goal_topic").value, goal_qos
-        )
-        self.path_pub = self.create_publisher(Path, self.get_parameter("path_topic").value, 10)
-        self.status_pub = self.create_publisher(
-            String, self.get_parameter("path_status_topic").value, 10
-        )
-        self.create_subscription(
-            Odometry, self.get_parameter("odometry_topic").value, self._on_odometry, 10
-        )
-        self.create_subscription(
-            PoseStamped, self.get_parameter("goal_topic").value, self._on_goal, 10
-        )
-        if self.get_parameter("dynamic_obstacles").value:
-            self.create_subscription(
-                MarkerArray,
-                self.get_parameter("obstacle_topic").value,
-                self._on_obstacles,
-                10,
-            )
+        self.odometry_subscription = self.create_subscription(Odometry, odom_topic, self._on_odometry, 10)
+        self.create_subscription(PoseStamped, self._p("goal_topic"), self._on_goal, 10)
+        self.create_subscription(String, self._p("obstacle_updates_topic"), self._on_obstacles, 10)
         self._load_obstacles()
-        rate = float(self.get_parameter("planning_rate").value)
-        self.timer = self.create_timer(1.0 / rate, self._plan_if_requested)
+        self.create_timer(1.0 / max(float(self._p("planning_rate_hz")), 0.1), self._plan)
+        self.get_logger().info(f"path-only IFDS ready: odometry={odom_topic}, frame={self.frame}")
+
+    def _p(self, name):
+        return self.get_parameter(name).value
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
     def _transform(self, position, orientation, source_frame, stamp):
-        if not source_frame:
-            raise ValueError("EMPTY_INPUT_FRAME")
-        position = np.asarray(position, dtype=float)
-        orientation = np.asarray(orientation, dtype=float)
-        if position.shape != (3,) or not np.all(np.isfinite(position)):
-            raise ValueError("NONFINITE_INPUT_POSITION")
-        if orientation.shape != (4,) or not np.all(np.isfinite(orientation)):
-            raise ValueError("NONFINITE_INPUT_QUATERNION")
+        position = np.asarray(position, float)
+        orientation = np.asarray(orientation, float)
+        if not source_frame or position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ValueError("INVALID_INPUT_FRAME_OR_POSITION")
+        if orientation.shape != (4,) or not np.all(np.isfinite(orientation)) or np.linalg.norm(orientation) < 1e-12:
+            raise ValueError("INVALID_INPUT_QUATERNION")
         if source_frame == self.frame:
-            return position, orientation
+            return position, orientation / np.linalg.norm(orientation)
         try:
-            transform = self.tf_buffer.lookup_transform(
-                self.frame,
-                source_frame,
-                rclpy.time.Time.from_msg(stamp),
-                timeout=Duration(seconds=float(self.get_parameter("tf_timeout").value)),
+            tf = self.tf_buffer.lookup_transform(
+                self.frame, source_frame, rclpy.time.Time.from_msg(stamp),
+                timeout=Duration(seconds=float(self._p("tf_timeout"))),
             )
         except TransformException as exception:
             raise ValueError("TF_UNAVAILABLE") from exception
-        translation = transform.transform.translation
-        rotation = transform.transform.rotation
-        transform_q = [rotation.x, rotation.y, rotation.z, rotation.w]
-        output_position = transform_position(
-            position, [translation.x, translation.y, translation.z], transform_q
-        )
-        output_orientation = multiply_quaternions(transform_q, orientation)
-        return output_position, output_orientation
+        t, q = tf.transform.translation, tf.transform.rotation
+        quaternion = [q.x, q.y, q.z, q.w]
+        return transform_position(position, [t.x, t.y, t.z], quaternion), multiply_quaternions(quaternion, orientation)
 
     def _on_odometry(self, message: Odometry) -> None:
         pose = message.pose.pose
         try:
-            position, _ = self._transform(
+            self.position, _ = self._transform(
                 [pose.position.x, pose.position.y, pose.position.z],
                 [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
-                message.header.frame_id,
-                message.header.stamp,
+                message.header.frame_id, message.header.stamp,
             )
+            self.replan_requested = self.goal is not None
         except ValueError as exception:
             self.position = None
             self._invalidate(str(exception))
-            return
-        self.position = position
-        if self.goal is not None:
-            self.replan_requested = True
 
     def _on_goal(self, message: PoseStamped) -> None:
         pose = message.pose
@@ -148,18 +127,12 @@ class IFDSPlannerNode(Node):
             position, orientation = self._transform(
                 [pose.position.x, pose.position.y, pose.position.z],
                 [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
-                message.header.frame_id,
-                message.header.stamp,
+                message.header.frame_id, message.header.stamp,
             )
-            if np.linalg.norm(orientation) < 1e-12:
-                raise ValueError("INVALID_GOAL_QUATERNION")
         except ValueError as exception:
-            self.goal = None
-            self.goal_orientation = None
             self._invalidate(str(exception))
             return
-        self.goal = position
-        self.goal_orientation = orientation / np.linalg.norm(orientation)
+        self.goal, self.goal_orientation = position, orientation
         self.goal_generation += 1
         self.replan_requested = True
         checked = PoseStamped()
@@ -168,120 +141,96 @@ class IFDSPlannerNode(Node):
         if checked.header.stamp.sec == 0 and checked.header.stamp.nanosec == 0:
             checked.header.stamp.nanosec = 1
         checked.pose.position.x, checked.pose.position.y, checked.pose.position.z = position
-        (
-            checked.pose.orientation.x,
-            checked.pose.orientation.y,
-            checked.pose.orientation.z,
-            checked.pose.orientation.w,
-        ) = self.goal_orientation
+        (checked.pose.orientation.x, checked.pose.orientation.y,
+         checked.pose.orientation.z, checked.pose.orientation.w) = orientation
         self.goal_pub.publish(checked)
 
+    def _parse_obstacles(self, data):
+        if not isinstance(data, dict) or not isinstance(data.get("header"), dict):
+            raise ValueError("OBSTACLE_HEADER_REQUIRED")
+        if data["header"].get("frame_id") != self.frame:
+            raise ValueError("OBSTACLE_FRAME_MISMATCH")
+        items = data.get("obstacles", [])
+        if not items and not bool(self._p("allow_empty_obstacles")):
+            raise ValueError("EMPTY_OBSTACLE_MAP_NOT_ALLOWED")
+        return [obstacle_from_mapping(item) for item in items]
+
     def _load_obstacles(self) -> None:
-        path = str(self.get_parameter("obstacle_yaml").value)
-        if not path:
-            return
+        path = str(self._p("obstacles_yaml"))
         try:
+            if not path:
+                raise ValueError("OBSTACLE_YAML_REQUIRED")
             data = yaml.safe_load(FilePath(path).read_text()) or {}
-            if data.get("frame_id") != self.frame:
-                raise ValueError("OBSTACLE_FRAME_MISMATCH")
-            self.obstacles = [
-                SphereObstacle(item["center"], float(item["radius"]))
-                for item in data.get("obstacles", [])
-            ]
-        except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exception:
-            self.obstacles = []
-            self.obstacles_valid = False
-            self._invalidate(f"INVALID_OBSTACLE_YAML:{exception}")
+            obstacles = self._parse_obstacles(data)
+            if bool(self._p("validate_world_consistency")):
+                world = str(self._p("world_sdf"))
+                valid, reasons = validate_obstacle_world(path, world, self.frame)
+                if not valid:
+                    raise ValueError("WORLD_MISMATCH:" + ";".join(reasons))
+            self.obstacles, self.map_valid = obstacles, True
+            self.obstacle_generation += 1
+        except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as exception:
+            self.obstacles, self.map_valid = [], False
+            self._invalidate(f"INVALID_OBSTACLE_MAP:{exception}")
 
-    def _on_obstacles(self, message: MarkerArray) -> None:
-        updated = []
+    def _on_obstacles(self, message: String) -> None:
         try:
-            for marker in message.markers:
-                if marker.header.frame_id != self.frame:
-                    raise ValueError("OBSTACLE_FRAME_MISMATCH")
-                if marker.action == marker.DELETEALL:
-                    updated = []
-                    continue
-                if marker.action == marker.DELETE:
-                    continue
-                radius = max(marker.scale.x, marker.scale.y, marker.scale.z) / 2.0
-                updated.append(
-                    SphereObstacle(
-                        [marker.pose.position.x, marker.pose.position.y, marker.pose.position.z],
-                        radius,
-                    )
-                )
-        except ValueError as exception:
-            self.obstacles_valid = False
-            self._invalidate(str(exception))
+            data = yaml.safe_load(message.data) or {}
+            obstacles = self._parse_obstacles(data)
+        except (ValueError, TypeError, KeyError, yaml.YAMLError) as exception:
+            self.map_valid = False
+            self._invalidate(f"INVALID_OBSTACLE_UPDATE:{exception}")
             return
-        self.obstacles = updated
-        self.obstacles_valid = True
-        self.replan_requested = True
+        self.obstacles, self.map_valid = obstacles, True
+        self.obstacle_generation += 1
+        self.replan_requested = self.goal is not None and self.position is not None
 
-    def _plan_if_requested(self) -> None:
-        if not self.replan_requested:
-            return
-        self.replan_requested = False
-        if self.position is None or self.goal is None or not self.obstacles_valid:
-            self._invalidate("MISSING_POSITION_OR_GOAL")
-            return
-        now = self.get_clock().now()
-        try:
-            points = plan_ifds_path(
-                self.position,
-                self.goal,
-                self.obstacles,
-                float(self.get_parameter("obstacle_clearance").value),
-                float(self.get_parameter("target_threshold").value),
-            )
-        except ValueError as exception:
-            self._invalidate(str(exception))
-            return
-        path = Path()
-        path.header.frame_id = self.frame
-        path.header.stamp = now.to_msg()
-        if path.header.stamp.sec == 0 and path.header.stamp.nanosec == 0:
-            path.header.stamp.nanosec = 1
-        for point in points:
-            waypoint = PoseStamped()
-            waypoint.header = path.header
-            waypoint.pose.position.x, waypoint.pose.position.y, waypoint.pose.position.z = point
-            waypoint.pose.orientation.w = 1.0
-            path.poses.append(waypoint)
-        self.path_generation += 1
-        self.path_pub.publish(path)
-        stamp_ns = path.header.stamp.sec * 1_000_000_000 + path.header.stamp.nanosec
-        planned_at = stamp_ns * 1e-9
-        self._publish_status(
-            PathStatus(
-                True,
-                stamp_ns,
-                self.path_generation,
-                self.goal_generation,
-                planned_at,
-                planned_at + float(self.get_parameter("path_validity_duration").value),
-                "PATH_REACHES_MISSION_GOAL",
-            )
-        )
+    def _config(self) -> IFDSConfig:
+        names = IFDSConfig.__dataclass_fields__
+        return IFDSConfig(**{name: self._p(name) for name in names})
 
-    def _invalidate(self, reason: str) -> None:
+    def _plan(self) -> None:
+        if not self.replan_requested or self.position is None or self.goal is None or not self.map_valid:
+            return
         self.replan_requested = False
         now = self._now()
-        self._publish_status(
-            PathStatus(
-                False,
-                0,
-                self.path_generation,
-                self.goal_generation,
-                now,
-                now,
-                reason or "NO_VALID_IFDS_PATH",
-            )
+        if np.linalg.norm(self.position - self.goal) <= 1e-9:
+            self._invalidate("ALREADY_AT_MISSION_GOAL")
+            return
+        planner = IFDSPlanner(self._config(), list(self.obstacles), plan_time_s=now)
+        found, waypoints, reason = planner.plan(self.position.copy(), self.goal.copy())
+        if found:
+            found, waypoints, reason = append_exact_ifds_goal(planner, waypoints, self.goal)
+        if not found or len(waypoints) < 2 or not np.all(np.isfinite(waypoints)):
+            self._invalidate(reason or "NO_VALID_IFDS_PATH")
+            return
+        stamp = self.get_clock().now().to_msg()
+        if stamp.sec == 0 and stamp.nanosec == 0:
+            stamp.nanosec = 1
+        stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        generation = self.semantic_generation.update(
+            waypoints, self.position, self.goal_generation, self.obstacle_generation
         )
-
-    def _publish_status(self, status: PathStatus) -> None:
+        path = Path()
+        path.header.frame_id, path.header.stamp = self.frame, stamp
+        for point in waypoints:
+            pose = PoseStamped()
+            pose.header = path.header
+            pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = point
+            pose.pose.orientation.w = 1.0
+            path.poses.append(pose)
+        status = PathStatus(True, stamp_ns, generation, self.goal_generation,
+                            self.obstacle_generation, now,
+                            now + float(self._p("path_validity_duration")), reason)
+        self.path_pub.publish(path)
         self.status_pub.publish(String(data=status.to_json()))
+
+    def _invalidate(self, reason: str) -> None:
+        status = PathStatus(False, 0, self.semantic_generation.generation,
+                            self.goal_generation, self.obstacle_generation,
+                            max(self._now(), 0.0), max(self._now(), 0.0), str(reason))
+        self.status_pub.publish(String(data=status.to_json()))
+        self.get_logger().error(f"IFDS path invalid: {reason}")
 
 
 def main(args=None) -> None:

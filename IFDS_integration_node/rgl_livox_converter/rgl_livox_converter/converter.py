@@ -61,7 +61,7 @@ class RglLivoxConverter(Node):
             depth=10,
             durability=DurabilityPolicy.VOLATILE,
         )
-        
+
         if self.scan_period <= 0.0:
             raise ValueError('scan_period must be greater than zero')
 
