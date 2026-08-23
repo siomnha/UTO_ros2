@@ -1,0 +1,20 @@
+ifds_planner:
+  ros__parameters:
+    use_sim_time: true
+    planner_only: true
+    planning_frame: map
+    odometry_topic: /Odometry
+    goal_topic: /ifds/goal
+    mission_goal_topic: /ifds/mission_goal
+    path_topic: /ifds/local_path
+    path_status_topic: /ifds/path_status
+    obstacle_topic: /ifds/obstacles
+    obstacle_yaml: ""
+    obstacle_frame: map
+    planning_rate: 2.0
+    path_validity_duration: 0.8
+    target_threshold: 0.05
+    obstacle_clearance: 0.25
+    tf_timeout: 0.10
+    gnss_denied: true
+    dynamic_obstacles: false

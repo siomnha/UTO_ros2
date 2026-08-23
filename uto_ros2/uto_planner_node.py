@@ -11,10 +11,12 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import Odometry, Path
 from px4_msgs.msg import VehicleOdometry
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from .belief_adapter import Belief
 from .ifds_path_adapter import Polyline, path_generation
+from .ifds_core import PathStatus, status_matches_path
 from .math_utils import align_enu_velocity, ned_to_enu
 from .planner_runtime import (
     CommitOutcome,
@@ -37,6 +39,7 @@ from .planner_runtime import (
     mission_goal_yaw_and_generation,
     planning_data_fresh,
     terminal_goal_data_fresh,
+    invalid_ifds_path_requires_hold,
     update_goal_dwell,
 )
 
@@ -71,6 +74,7 @@ class UTOPlannerNode(Node):
         self.belief = None
         self.belief_stable = False
         self.path = None
+        self.path_status = None
         self.mission_goal = None
         self.goal_restart_pending = False
         self.velocity = None
@@ -121,10 +125,21 @@ class UTOPlannerNode(Node):
         self.create_subscription(Odometry, self._parameter("belief_topic"), self._on_odometry, 10)
         self.create_subscription(Path, self._parameter("path_topic"), self._on_path, 10)
         self.create_subscription(
+            String,
+            self._parameter("path_status_topic"),
+            self._on_path_status,
+            10,
+        )
+        goal_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
             PoseStamped,
             self._parameter("mission_goal_topic"),
             self._on_mission_goal,
-            10,
+            goal_qos,
         )
         self.create_subscription(
             String, self._parameter("px4_state_topic"), self._on_px4_status, 10
@@ -260,17 +275,60 @@ class UTOPlannerNode(Node):
             for pose in message.poses
         ]
         try:
+            stamp_ns = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
             path = {
                 "stamp": stamp,
+                "stamp_ns": stamp_ns,
                 "received": self._now(),
                 "polyline": Polyline(points),
-                "generation": path_generation(stamp, points),
+                "generation": path_generation(
+                    stamp, points, self._parameter("path_generation_resolution")
+                ),
             }
         except ValueError as exception:
             self._publish_diagnostics(str(exception), "ERROR")
             return
         with self.lock:
             self.path = path
+
+    def _on_path_status(self, message: String) -> None:
+        try:
+            status = PathStatus.from_json(message.data)
+        except (ValueError, TypeError, json.JSONDecodeError) as exception:
+            self._invalidate_ifds_path(f"INVALID_PATH_STATUS:{exception}")
+            return
+        with self.lock:
+            path_matches = self.path is not None and self.path["stamp_ns"] == status.path_stamp_ns
+            self.path_status = status
+        if not status.valid:
+            self._invalidate_ifds_path(status.reason)
+            return
+        if not path_matches:
+            self._invalidate_ifds_path("PATH_STATUS_STAMP_MISMATCH")
+
+    def _invalidate_ifds_path(self, reason: str) -> None:
+        now = self._now()
+        with self.lock:
+            previous = self.path_status
+            self.path_status = PathStatus(
+                False,
+                0,
+                previous.path_generation if previous else 0,
+                previous.goal_generation if previous else 0,
+                now,
+                now,
+                reason or "NO_VALID_IFDS_PATH",
+            )
+            self.path = None
+            self.buffer.discard_candidate()
+            self.request_generation += 1
+            active_state = invalid_ifds_path_requires_hold(self.state)
+            if not active_state and self.state not in (PlannerState.FAULT, PlannerState.SAFE_HOLD):
+                self.state = PlannerState.WAIT_IFDS_INITIAL_PATH
+        if active_state:
+            self._enter_safe_hold(f"IFDS path invalid: {reason}", self._snapshot())
+        else:
+            self._publish_diagnostics(f"IFDS path invalid: {reason}", "WARN")
 
     def _on_mission_goal(self, message: PoseStamped) -> None:
         stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
@@ -412,6 +470,13 @@ class UTOPlannerNode(Node):
 
     def _path_fresh(self, snapshot: PlannerSnapshot) -> bool:
         if snapshot.path is None:
+            return False
+        status = self.path_status
+        if (
+            status is None
+            or not status.valid
+            or not status_matches_path(status, snapshot.path["stamp_ns"], snapshot.now)
+        ):
             return False
         timeout = self._parameter("path_timeout")
         receive_age = snapshot.now - snapshot.path["received"]
@@ -558,12 +623,20 @@ class UTOPlannerNode(Node):
             self.manager.stale_discards += 1
             if request.first:
                 self.first_request_submitted = False
-                self.state = PlannerState.BUILDING_NLP
+                self.state = (
+                    PlannerState.BUILDING_NLP
+                    if self.path is not None
+                    else PlannerState.WAIT_IFDS_INITIAL_PATH
+                )
             return
         if isinstance(result, Exception):
             if request.first:
                 self.first_request_submitted = False
-                self.state = PlannerState.BUILDING_NLP
+                self.state = (
+                    PlannerState.BUILDING_NLP
+                    if self.path is not None
+                    else PlannerState.WAIT_IFDS_INITIAL_PATH
+                )
             elif self.buffer.remaining(now) <= 0:
                 self.pending_safety_reason = "planner worker failed"
             self._publish_diagnostics(str(result), "ERROR")
@@ -591,7 +664,11 @@ class UTOPlannerNode(Node):
             self.state = PlannerState.TRAJECTORY_READY if request.first else PlannerState.REPLANNING
         elif request.first:
             self.first_request_submitted = False
-            self.state = PlannerState.BUILDING_NLP
+            self.state = (
+                PlannerState.BUILDING_NLP
+                if self.path is not None
+                else PlannerState.WAIT_IFDS_INITIAL_PATH
+            )
         elif reason not in ("stale", "late") and self.buffer.remaining(now) <= 0:
             self.pending_safety_reason = "candidate admission failed"
         self._publish_diagnostics(reason)
@@ -757,6 +834,9 @@ class UTOPlannerNode(Node):
             "actual_commit_error": self.last_commit_errors,
             "belief_age": self._now() - self.belief.stamp if self.belief else None,
             "path_age": self._now() - self.path["stamp"] if self.path else None,
+            "ifds_path_status_valid": self.path_status.valid if self.path_status else None,
+            "ifds_path_status_reason": self.path_status.reason if self.path_status else None,
+            "ifds_path_valid_until": self.path_status.valid_until if self.path_status else None,
             "velocity_age": (
                 self._now() - self.velocity_stamp if self.velocity is not None else None
             ),

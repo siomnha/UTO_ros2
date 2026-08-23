@@ -17,6 +17,7 @@ setup(
         "console_scripts": [
             "uto_planner=uto_ros2.uto_planner_node:main",
             "px4_offboard_bridge=uto_ros2.px4_offboard_bridge_node:main",
+            "ifds_planner=uto_ros2.ifds_planner_node:main",
         ]
     },
 )

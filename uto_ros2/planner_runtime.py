@@ -47,6 +47,14 @@ class CommitOutcome(Enum):
     LATE = auto()
 
 
+def invalid_ifds_path_requires_hold(state: PlannerState) -> bool:
+    return state in (
+        PlannerState.TRAJECTORY_READY,
+        PlannerState.EXECUTING,
+        PlannerState.REPLANNING,
+    )
+
+
 @dataclass(frozen=True)
 class PlanningRequest:
     request_generation: int
@@ -797,6 +805,8 @@ class Px4CommandSequencer:
 PLANNER_PARAMETER_DEFAULTS = {
     "belief_topic": "/Odometry",
     "path_topic": "/ifds/local_path",
+    "path_status_topic": "/ifds/path_status",
+    "path_generation_resolution": 0.05,
     "mission_goal_topic": "/ifds/mission_goal",
     "mission_goal_timeout": 0.0,
     "velocity_topic": "/uto/velocity",

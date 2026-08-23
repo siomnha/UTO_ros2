@@ -13,6 +13,8 @@ uto_ros2/
 ├── lgr.py                        # LGR nodes/D/quadrature/interpolation
 ├── belief_adapter.py             # FAST-LIO covariance, sigma, SO(3) stability
 ├── ifds_path_adapter.py          # polyline/project/lookahead/hash
+├── ifds_core.py                  # path-only IFDS geometry/status primitives
+├── ifds_planner_node.py          # IFDS path/status/mission-goal ROS node
 ├── uto_nlp.py                    # fixed reusable CasADi/IPOPT LGR graph
 ├── trajectory.py                 # sole trajectory/schema/interpolation/buffer implementation
 ├── planner_runtime.py            # sole state/request/delay/gate/worker runtime
@@ -20,7 +22,7 @@ uto_ros2/
 └── px4_offboard_bridge_node.py   # ROS PX4 bridge node
 ```
 
-旧的`async_worker.py`、`delay_compensator.py`、`feasibility_gate.py`、`state_machine.py`、`trajectory_buffer.py`和`planner_core.py`已删除且无残余import。系统只有两个ROS nodes；“10个LGR collocation nodes”是2 regions × 5 nodes，“7 sigma trajectories”是同一NLP中的不确定轨迹，不是ROS nodes。
+旧的`async_worker.py`、`delay_compensator.py`、`feasibility_gate.py`、`state_machine.py`、`trajectory_buffer.py`和`planner_core.py`已删除且无残余import。系统有三个在线ROS nodes（IFDS、UTO planner、PX4 bridge）；“10个LGR collocation nodes”是2 regions × 5 nodes，“7 sigma trajectories”是同一NLP中的不确定轨迹，不是ROS nodes。
 
 ## Planner双timer和线程模型
 
@@ -91,6 +93,53 @@ IFDS必须为path-only，关闭IFDS/MAVROS direct setpoint。IFDS和UTO必须使
 
 IFDS契约是：(1) 持续发布有新ROS timestamp的local path；(2) 每个任务或全局goal变化时发布mission goal；(3) 绝不直接向PX4/MAVROS发布setpoint。`SAFE_HOLD`只有PX4 connected/no-failsafe/hold-ready、belief重新稳定、velocity/path fresh时才能通过resume；FAULT不能普通resume。
 
+## IFDS–UTO integration（第一阶段）
+
+唯一在线控制链为：
+
+```text
+FAST-LIO2 /Odometry ───────────────────────────────→ uto_planner
+/ifds/goal → ifds_planner → /ifds/mission_goal ───→ uto_planner
+                         └→ /ifds/local_path ───────→ uto_planner
+                         └→ /ifds/path_status ──────→ uto_planner
+uto_planner → /uto/trajectory → px4_offboard_bridge → /fmu/in/* → PX4
+```
+
+`ifds_planner`是严格的path-only节点：它只消费position mean、任务goal和障碍物，发布path、结构化status和检查后的mission goal；代码中不创建MAVROS/PX4 publisher、setpoint timer、carrot chasing或hold command。FAST-LIO的完整belief只进入UTO，IFDS不消费其covariance。`px4_offboard_bridge`是唯一飞控setpoint发布者。仓库若同时包含`IFDS_integration_node/ifds_gz_plugins`、`rgl_livox_converter`和`world_sdf`，这些只是Gazebo/传感器辅助包，不属于在线控制链，也不能发布飞控setpoint。
+
+### Topics与安全契约
+
+| Owner | Topic | Type/语义 |
+|---|---|---|
+| mission client → IFDS | `/ifds/goal` | `geometry_msgs/PoseStamped`原始任务输入 |
+| IFDS → UTO | `/ifds/mission_goal` | reliable + transient-local检查后目标 |
+| IFDS → UTO | `/ifds/local_path` | `nav_msgs/Path`，精确goal为末点 |
+| IFDS → UTO | `/ifds/path_status` | `std_msgs/String`，严格JSON schema |
+| UTO → bridge | `/uto/trajectory` | 唯一可执行physical trajectory |
+
+Goal和odometry若不在`planning_frame=map`，IFDS必须先取得TF并实际变换坐标；empty frame、TF timeout或转换失败会发布`valid=false`，绝不只替换`frame_id`。静态障碍物YAML必须声明`frame_id: map`；在线Marker障碍物frame不一致时fail closed。`target_threshold=0.05 m`仅控制IFDS积分终止，发布前还会用现有segment-clearance判据验证并追加精确mission goal，最终到达仍由UTO的position/velocity/dwell/freshness判断。
+
+每条Path紧接一个status；`path_stamp_ns`必须精确等于Path header stamp，`valid_until`默认0.8 s。UTO只有在status valid、stamp匹配且未过期时使用Path。首次执行前invalid会清除path/candidate并留在hold等待；`TRAJECTORY_READY/EXECUTING/REPLANNING`收到invalid、无法解析的JSON或stamp mismatch会立即丢弃candidate并进入`SAFE_HOLD`，不会等待普通`path_timeout`。Path generation只hash按`path_generation_resolution=0.05 m`量化后的几何，不含timestamp，因此相同路径的高频重发不会让约0.9 s first solve永久stale；freshness仍使用最新Path timestamp/status。
+
+发送任务示例：
+
+```bash
+ros2 topic pub --once /ifds/goal geometry_msgs/msg/PoseStamped \
+  "{header: {frame_id: map}, pose: {position: {x: 5.0, y: 0.0, z: 1.5}, orientation: {w: 1.0}}}"
+ros2 topic echo /ifds/path_status
+```
+
+启动模式与障碍物选择：
+
+```bash
+ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=global \
+  ifds_obstacles:=/absolute/path/static_obstacles.yaml dynamic_obstacles:=false
+ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online \
+  ifds_obstacles:=/absolute/path/static_seed.yaml dynamic_obstacles:=true
+```
+
+三个节点统一使用sim time和`map` frame，不使用固定sleep。PX4先takeoff/hold，UTO按`WAIT_PX4 → TAKEOFF → HOLD → WAIT_BELIEF_STABLE → WAIT_IFDS_INITIAL_PATH → BUILDING_NLP → FIRST_SOLVE → EXECUTING`推进；约0.9 s cold build/solve和约0.4 s online solve期间bridge仍独立发布hold/setpoint。当前第一阶段没有动态障碍物未来位置预测、commit-time path compatibility检查或UTO obstacle constraints；path-tube gate仍不等价于碰撞保证。
+
 ## Build和运行
 
 ```bash
@@ -114,7 +163,7 @@ python3 -m pytest -q test/test_ros_integration_optional.py
 colcon test --packages-select uto_ros2 && colcon test-result --verbose
 ```
 
-Pure tests覆盖SO(3)、yaw wrap、delay velocity dispersion/process noise、dense rollout、dual-rate commit helpers、completion queue、goal dwell、global commit generation、trajectory interpolation、PX4 control levels和旧模块检查。Solver test包含小型1×2×7和默认2×5×7的build/two-solve/reuse/residual/covariance/timing检查。
+Pure tests覆盖SO(3)、yaw wrap、delay velocity dispersion/process noise、dense rollout、dual-rate commit helpers、completion queue、goal dwell、semantic path generation、IFDS exact-goal path/status/TF fail-closed contract、trajectory interpolation、PX4 control levels和旧模块检查。Solver test包含小型1×2×7和默认2×5×7的build/two-solve/reuse/residual/covariance/timing检查。
 
 ROS optional test在依赖齐全时实际初始化rclpy并构造planner/bridge，检查独立planning/commit timers和默认PX4层级；它仍不是完整fake-topic状态序列或Gazebo验证。若目标CI需要完整消息闭环，应继续加入匹配该PX4版本的fake publishers/ACK fixture。当前README不声称Gazebo、PX4 SITL或未执行tests已经通过。
 

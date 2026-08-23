@@ -34,7 +34,13 @@ class Polyline:
         return np.array([self.at(s + i * spacing) for i in range(count)])
 
 
-def path_generation(stamp, points):
-    return hashlib.sha256(
-        (str(stamp) + np.asarray(points, float).tobytes().hex()).encode()
-    ).hexdigest()[:16]
+def path_generation(stamp_or_points, points=None, resolution=0.05):
+    """Hash quantized geometry only; timestamps remain freshness metadata."""
+    geometry = stamp_or_points if points is None else points
+    geometry = np.asarray(geometry, dtype=float).reshape(-1, 3)
+    if resolution <= 0.0 or not np.isfinite(resolution):
+        raise ValueError("path generation resolution must be positive")
+    if not np.all(np.isfinite(geometry)):
+        raise ValueError("path generation geometry must be finite")
+    quantized = np.rint(geometry / resolution).astype(np.int64)
+    return hashlib.sha256(quantized.tobytes()).hexdigest()[:16]
