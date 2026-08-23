@@ -213,31 +213,97 @@ def reconstruct_joint_tangent_from_sigma(sigma_states):
     return mean, rotation, (covariance + covariance.T) / 2.0, deviations
 
 
+@dataclass(frozen=True)
+class SigmaProjectionDiagnostics:
+    relative_covariance_error: float
+    position_velocity_cross_error: float
+    attitude_velocity_cross_error: float
+    target_rank: int
+    reconstructed_rank: int
+    discarded_eigenvalue_energy: float
+
+
+@dataclass(frozen=True)
+class SigmaProjectionResult:
+    sigma_states: np.ndarray
+    mean_state: np.ndarray
+    mean_rotation: np.ndarray
+    covariance: np.ndarray
+    target_covariance: np.ndarray
+    diagnostics: SigmaProjectionDiagnostics
+
+
+def _relative_block_error(actual, target, rows, columns, epsilon=1e-12):
+    actual_block = actual[np.ix_(rows, columns)]
+    target_block = target[np.ix_(rows, columns)]
+    return float(
+        np.linalg.norm(actual_block - target_block, ord="fro")
+        / max(np.linalg.norm(target_block, ord="fro"), epsilon)
+    )
+
+
 def joint_sigma_process_update(sigma_states, pose_process_covariance):
-    """Add pose noise through a joint rank-six tangent update preserving vertex identity."""
+    """Add pose noise using the best fixed-seven-sigma rank-six approximation."""
 
     sigma = np.asarray(sigma_states, dtype=float)
     process = np.asarray(pose_process_covariance, dtype=float).reshape(6, 6)
     mean, rotation, covariance, deviations = reconstruct_joint_tangent_from_sigma(sigma)
-    if np.max(np.abs(process)) == 0.0:
-        return sigma.copy(), mean, rotation, covariance
     target = covariance.copy()
     pose_indices = np.array([0, 1, 2, 6, 7, 8])
     target[np.ix_(pose_indices, pose_indices)] += process
     target = (target + target.T) / 2.0
     values, vectors = np.linalg.eigh(target)
-    order = np.argsort(values)[::-1][:6]
-    values = np.maximum(values[order], 0.0)
-    factor = vectors[:, order] * np.sqrt(values)
-    # Right singular coordinates retain each propagated simplex vertex identity.
-    _, _, right = np.linalg.svd(deviations, full_matrices=True)
-    latent = np.sqrt(7.0) * right[:6]
-    updated_deviations = factor @ latent
-    updated_deviations -= updated_deviations.mean(axis=1, keepdims=True)
-    updated = np.empty_like(sigma)
-    updated[:3] = mean[:3, None] + updated_deviations[:3]
-    updated[3:6] = mean[3:6, None] + updated_deviations[3:6]
-    for index in range(7):
-        updated[6:9, index] = rot_to_euler(rotation @ so3_exp(updated_deviations[6:9, index]))
-    new_mean, new_rotation, new_covariance, _ = reconstruct_joint_tangent_from_sigma(updated)
-    return updated, new_mean, new_rotation, new_covariance
+    positive = np.maximum(values, 0.0)
+    tolerance = max(float(np.max(positive)), 1.0) * 1e-10
+    target_rank = int(np.count_nonzero(positive > tolerance))
+    if np.max(np.abs(process)) == 0.0:
+        updated = sigma.copy()
+        new_mean, new_rotation, new_covariance = mean, rotation, covariance
+        discarded_energy = 0.0
+    else:
+        order = np.argsort(positive)[::-1]
+        kept = order[:6]
+        discarded = order[6:]
+        factor = vectors[:, kept] * np.sqrt(positive[kept])
+        # Preserve the propagated vertices' latent coordinates while projecting
+        # the generally rank>6 target onto the representable rank-six subspace.
+        _, _, right = np.linalg.svd(deviations, full_matrices=True)
+        latent = np.sqrt(sigma.shape[1]) * right[:6]
+        updated_deviations = factor @ latent
+        updated_deviations -= updated_deviations.mean(axis=1, keepdims=True)
+        updated = np.empty_like(sigma)
+        updated[:3] = mean[:3, None] + updated_deviations[:3]
+        updated[3:6] = mean[3:6, None] + updated_deviations[3:6]
+        for index in range(sigma.shape[1]):
+            updated[6:9, index] = rot_to_euler(
+                rotation @ so3_exp(updated_deviations[6:9, index])
+            )
+        _, estimated_rotation, _, _ = reconstruct_joint_tangent_from_sigma(updated)
+        correction = rotation @ estimated_rotation.T
+        for index in range(sigma.shape[1]):
+            updated_rotation = correction @ euler_to_rot(updated[6:9, index])
+            updated[6:9, index] = rot_to_euler(updated_rotation)
+        new_mean, new_rotation, new_covariance, _ = reconstruct_joint_tangent_from_sigma(updated)
+        discarded_energy = float(np.sum(positive[discarded]))
+    new_covariance = (new_covariance + new_covariance.T) / 2.0
+    reconstructed_rank = int(np.linalg.matrix_rank(new_covariance, tol=tolerance))
+    relative_error = float(
+        np.linalg.norm(new_covariance - target, ord="fro")
+        / max(np.linalg.norm(target, ord="fro"), 1e-12)
+    )
+    diagnostics = SigmaProjectionDiagnostics(
+        relative_error,
+        _relative_block_error(new_covariance, target, [0, 1, 2], [3, 4, 5]),
+        _relative_block_error(new_covariance, target, [6, 7, 8], [3, 4, 5]),
+        target_rank,
+        reconstructed_rank,
+        discarded_energy,
+    )
+    return SigmaProjectionResult(
+        updated,
+        new_mean,
+        new_rotation,
+        new_covariance,
+        target,
+        diagnostics,
+    )

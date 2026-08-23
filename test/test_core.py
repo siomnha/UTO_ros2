@@ -38,10 +38,14 @@ from uto_ros2.planner_runtime import (
     PlanningRequest,
     Px4CommandSequencer,
     can_resume,
+    can_restart_mission,
     execution_decision,
     goal_generation_changed,
     mission_goal_input_valid,
     mission_goal_satisfied,
+    mission_goal_yaw_and_generation,
+    planning_data_fresh,
+    terminal_goal_data_fresh,
     commit_continuity_errors,
     commit_due_status,
     offboard_control_flags,
@@ -90,7 +94,7 @@ def test_delay_uses_belief_absolute_time_and_process_noise_resamples():
         queried_times.append(absolute_time)
         return np.array([9.81 if absolute_time < 10.5 else 10.5, 0, 0, 0])
 
-    predictor = DelayPredictor(0.5, 20, 0.1, 2.0, 0.0, 0.0)
+    predictor = DelayPredictor(0.5, 20, 5, 0.1, 2.0, 0.0, 0.0)
     zero_sigma, _, _, zero_covariance = predictor.propagate(
         sigma, 10.0, 11.0, control_at, np.zeros(9)
     )
@@ -259,7 +263,7 @@ def test_delay_preserves_propagated_velocity_dispersion():
     covariance = np.diag([1e-8, 1e-8, 1e-8, 0.04, 0.04, 0.04])
     sigma, _ = sigma_states([0, 0, 1], np.eye(3), [0, 0, 0], covariance)
     assert np.max(np.ptp(sigma[3:6], axis=1)) == 0
-    predictor = DelayPredictor(0.5, 20, 0.1, 2.0, 0.0, 0.0)
+    predictor = DelayPredictor(0.5, 20, 5, 0.1, 2.0, 0.0, 0.0)
     propagated, mean, _, _ = predictor.propagate(
         sigma, 1.0, 1.5, lambda _: np.array([9.81, 0, 0, 0]), np.ones(9) * 0.01
     )
@@ -354,6 +358,10 @@ def test_runtime_defaults_separate_planning_and_commit_rates():
 
     assert PLANNER_PARAMETER_DEFAULTS["replan_rate"] == 1.5
     assert PLANNER_PARAMETER_DEFAULTS["commit_check_rate"] == 50.0
+    assert PLANNER_PARAMETER_DEFAULTS["delay_p90_min_samples"] == 5
+    assert PLANNER_PARAMETER_DEFAULTS["delay_p90_min_samples"] <= PLANNER_PARAMETER_DEFAULTS[
+        "delay_p90_window"
+    ]
 
 
 def test_legacy_runtime_modules_are_absent():
@@ -400,9 +408,11 @@ def test_commit_outcome_prioritizes_due_candidate_over_expired_active():
         execution_decision(CommitOutcome.REJECTED, True, 0.0, False) == ExecutionDecision.SAFE_HOLD
     )
     assert (
-        execution_decision(CommitOutcome.NONE, True, 0.0, False, True)
+        execution_decision(CommitOutcome.NONE, True, 0.0, False, True, True)
         == ExecutionDecision.CONTINUE
     )
+    assert execution_decision(CommitOutcome.WAITING, True, 0.0, False) == ExecutionDecision.CONTINUE
+    assert execution_decision(CommitOutcome.WAITING, False, 0.0, False) == ExecutionDecision.SAFE_HOLD
 
 
 def test_completion_processing_cannot_publish_safe_hold_directly():
@@ -461,38 +471,68 @@ def test_joint_sigma_update_preserves_cross_covariance_and_identity():
     base[3] = 2.0 * (base[0] - base[0].mean())
     base[4] = -1.5 * (base[7] - base[7].mean())
     before_mean, _, before_cov, _ = reconstruct_joint_tangent_from_sigma(base)
-    unchanged, unchanged_mean, _, unchanged_cov = joint_sigma_process_update(base, np.zeros((6, 6)))
-    assert np.allclose(unchanged, base)
-    assert np.allclose(unchanged_cov, before_cov)
-    assert np.allclose(unchanged_mean, before_mean)
+    unchanged = joint_sigma_process_update(base, np.zeros((6, 6)))
+    assert np.allclose(unchanged.sigma_states, base)
+    assert np.allclose(unchanged.covariance, before_cov)
+    assert np.allclose(unchanged.mean_state, before_mean)
     process = np.diag([0.005] * 6)
-    updated, updated_mean, _, updated_cov = joint_sigma_process_update(base, process)
+    projection = joint_sigma_process_update(base, process)
+    updated = projection.sigma_states
+    updated_mean = projection.mean_state
+    updated_cov = projection.covariance
     assert np.all(np.isfinite(updated_cov)) and np.allclose(updated_cov, updated_cov.T)
     assert np.allclose(updated_mean[:6], before_mean[:6], atol=1e-8)
+    assert np.linalg.norm(so3_log(projection.mean_rotation)) < 1e-8
     assert np.linalg.norm(updated_cov[:3, 3:6]) > 1e-4
     assert np.linalg.norm(updated_cov[6:9, 3:6]) > 1e-4
     assert np.trace(updated_cov[np.ix_([0, 1, 2, 6, 7, 8], [0, 1, 2, 6, 7, 8])]) > np.trace(
         before_cov[np.ix_([0, 1, 2, 6, 7, 8], [0, 1, 2, 6, 7, 8])]
     )
     assert np.max(np.ptp(updated[3:6], axis=1)) > 0
+    metrics = projection.diagnostics
+    assert metrics.target_rank > metrics.reconstructed_rank
+    assert metrics.reconstructed_rank <= 6
+    assert metrics.discarded_eigenvalue_energy >= 0.0
+    assert metrics.relative_covariance_error >= 0.0
+    assert metrics.position_velocity_cross_error >= 0.0
+    assert metrics.attitude_velocity_cross_error >= 0.0
+    assert all(np.isfinite(value) for value in (
+        metrics.relative_covariance_error,
+        metrics.position_velocity_cross_error,
+        metrics.attitude_velocity_cross_error,
+    ))
+    expected_covariance_error = np.linalg.norm(
+        projection.covariance - projection.target_covariance, ord="fro"
+    ) / np.linalg.norm(projection.target_covariance, ord="fro")
+    assert metrics.relative_covariance_error == pytest.approx(expected_covariance_error)
+    target_pv = projection.target_covariance[:3, 3:6]
+    expected_pv_error = np.linalg.norm(updated_cov[:3, 3:6] - target_pv, ord="fro") / max(
+        np.linalg.norm(target_pv, ord="fro"), 1e-12
+    )
+    assert metrics.position_velocity_cross_error == pytest.approx(expected_pv_error)
 
 
 def test_latency_estimator_cold_p90_clipping_and_margins():
-    predictor = DelayPredictor(0.5, 4, 0.1, 2.0, 0.02, 0.03, 0.01, 0.05, 1.0)
-    assert predictor.estimate_mode == "cold"
+    predictor = DelayPredictor(0.5, 4, 3, 0.1, 2.0, 0.02, 0.03, 0.01, 0.05, 1.0)
+    assert predictor.estimate_mode() == "initial_history"
     assert predictor.estimate() == pytest.approx(0.56)
+    assert predictor.estimate(True, 1.2) == pytest.approx(1.26)
     predictor.record_latency(0.1)
     predictor.record_latency(0.2)
     predictor.record_latency(10.0)  # clipped to 1.0
-    assert predictor.estimate_mode == "steady_p90"
+    assert predictor.estimate_mode() == "steady_p90"
     expected = np.percentile([0.1, 0.2, 1.0], 90) + 0.02 + 0.03 + 0.01
     assert predictor.estimate() == pytest.approx(expected)
     predictor.record_latency(0.8)  # includes a deterministic fake dense/queue delay
     assert predictor.percentile90() >= 0.8
+    predictor.record_latency(0.05)
+    assert list(predictor.samples) == [0.2, 1.0, 0.8, 0.05]
     with pytest.raises(ValueError):
         predictor.record_latency(float("nan"))
     with pytest.raises(ValueError):
         predictor.record_latency(-0.1)
+    with pytest.raises(ValueError):
+        DelayPredictor(0.5, 4, 5, 0.1, 2.0, 0.0, 0.0)
 
 
 def test_explicit_mission_goal_not_local_path_endpoint_and_yaw_wrap():
@@ -517,3 +557,43 @@ def test_mission_goal_validation_and_generation_semantics():
     old = SimpleNamespace(generation="1,2,3,0")
     assert not goal_generation_changed(old, "1,2,3,0")
     assert goal_generation_changed(old, "4,5,6,0")
+
+
+def test_position_only_and_yaw_goal_generation():
+    position = np.array([1.0, 2.0, 3.0])
+    yaw, generation = mission_goal_yaw_and_generation(position, [0, 0, 0, 0], False)
+    assert yaw is None
+    _, changed_orientation = mission_goal_yaw_and_generation(position, [0, 0, 1, 0], False)
+    assert changed_orientation == generation
+    with pytest.raises(ValueError):
+        mission_goal_yaw_and_generation(position, [0, 0, 0, 0], True)
+    yaw_a, generation_a = mission_goal_yaw_and_generation(
+        position, [0, 0, np.sin(np.deg2rad(179) / 2), np.cos(np.deg2rad(179) / 2)], True
+    )
+    yaw_b, generation_b = mission_goal_yaw_and_generation(
+        position, [0, 0, np.sin(np.deg2rad(-179) / 2), np.cos(np.deg2rad(-179) / 2)], True
+    )
+    assert generation_a != generation_b
+    assert abs(np.arctan2(np.sin(yaw_a - yaw_b), np.cos(yaw_a - yaw_b))) < np.deg2rad(3)
+
+
+def test_planning_terminal_freshness_and_restart_readiness():
+    assert planning_data_fresh(0.1, 0.3, True, True)
+    assert not planning_data_fresh(0.4, 0.3, True, True)
+    assert terminal_goal_data_fresh(0.1, 0.3, True, True)
+    assert terminal_goal_data_fresh(0.1, 0.3, True, True) and not planning_data_fresh(
+        0.1, 0.3, True, False
+    )
+    assert not terminal_goal_data_fresh(0.1, 0.3, False, True)
+    ready = {"connected": True, "hold_ready": True, "failsafe": False}
+    args = (PlannerState.GOAL_REACHED, True, ready, True, True, True, True, True)
+    assert can_restart_mission(*args)
+    assert not can_restart_mission(*args[:5], False, *args[6:])
+    stale_velocity = list(args)
+    stale_velocity[6] = False
+    assert not can_restart_mission(*stale_velocity)
+    stale_path = list(args)
+    stale_path[7] = False
+    assert not can_restart_mission(*stale_path)
+    failsafe = dict(ready, failsafe=True)
+    assert not can_restart_mission(PlannerState.GOAL_REACHED, True, failsafe, True, True, True, True, True)

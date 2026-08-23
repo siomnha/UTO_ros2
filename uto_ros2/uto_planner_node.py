@@ -15,7 +15,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from .belief_adapter import Belief
 from .ifds_path_adapter import Polyline, path_generation
-from .math_utils import align_enu_velocity, ned_to_enu, quat_to_rot, rot_to_euler
+from .math_utils import align_enu_velocity, ned_to_enu
 from .planner_runtime import (
     CommitOutcome,
     ExecutionDecision,
@@ -26,6 +26,7 @@ from .planner_runtime import (
     TimingBreakdown,
     WorkerResult,
     build_runtime_components,
+    can_restart_mission,
     can_resume,
     commit_continuity_errors,
     commit_due_status,
@@ -33,6 +34,9 @@ from .planner_runtime import (
     goal_generation_changed,
     mission_goal_input_valid,
     mission_goal_satisfied,
+    mission_goal_yaw_and_generation,
+    planning_data_fresh,
+    terminal_goal_data_fresh,
     update_goal_dwell,
 )
 
@@ -41,7 +45,7 @@ from .planner_runtime import (
 class MissionGoal:
     stamp: float
     position: np.ndarray
-    yaw: float
+    yaw: Optional[float]
     generation: str
 
 
@@ -286,18 +290,17 @@ class UTOPlannerNode(Node):
             return
         orientation = message.pose.orientation
         try:
-            yaw = float(
-                rot_to_euler(
-                    quat_to_rot([orientation.x, orientation.y, orientation.z, orientation.w])
-                )[2]
+            yaw, generation = mission_goal_yaw_and_generation(
+                position,
+                [orientation.x, orientation.y, orientation.z, orientation.w],
+                self._parameter("goal_yaw_enabled"),
             )
         except ValueError as exception:
             self._publish_diagnostics(str(exception), "ERROR")
             return
-        if not np.all(np.isfinite(position)) or not np.isfinite(yaw):
+        if not np.all(np.isfinite(position)) or (yaw is not None and not np.isfinite(yaw)):
             self._publish_diagnostics("non-finite mission goal", "ERROR")
             return
-        generation = ",".join(f"{value:.6f}" for value in (*position, yaw))
         with self.lock:
             changed = goal_generation_changed(self.mission_goal, generation)
             self.mission_goal = MissionGoal(stamp, position, yaw, generation)
@@ -366,10 +369,11 @@ class UTOPlannerNode(Node):
         goal_dwell_pending = self._goal_conditions(snapshot)
         decision = execution_decision(
             outcome,
-            self._data_fresh(snapshot),
+            self._planning_data_fresh(snapshot),
             self.buffer.remaining(snapshot.now),
             self.state == PlannerState.GOAL_REACHED,
             goal_dwell_pending,
+            self._terminal_goal_data_fresh(snapshot),
         )
         if decision == ExecutionDecision.SAFE_HOLD and self.state in (
             PlannerState.EXECUTING,
@@ -414,12 +418,31 @@ class UTOPlannerNode(Node):
         stamp_age = snapshot.now - snapshot.path["stamp"]
         return 0.0 <= receive_age <= timeout and 0.0 <= stamp_age <= timeout
 
-    def _data_fresh(self, snapshot: PlannerSnapshot) -> bool:
-        return (
-            snapshot.belief is not None
-            and 0.0 <= snapshot.now - snapshot.belief.stamp <= self._parameter("belief_timeout")
-            and snapshot.velocity_fresh
-            and self._path_fresh(snapshot)
+    def _belief_age(self, snapshot: PlannerSnapshot) -> float:
+        return np.inf if snapshot.belief is None else snapshot.now - snapshot.belief.stamp
+
+    def _mission_goal_valid(self, snapshot: PlannerSnapshot) -> bool:
+        goal = snapshot.mission_goal
+        if goal is None:
+            return False
+        timeout = self._parameter("mission_goal_timeout")
+        age = snapshot.now - goal.stamp
+        return age >= 0.0 and (timeout <= 0.0 or age <= timeout)
+
+    def _planning_data_fresh(self, snapshot: PlannerSnapshot) -> bool:
+        return planning_data_fresh(
+            self._belief_age(snapshot),
+            self._parameter("belief_timeout"),
+            snapshot.velocity_fresh,
+            self._path_fresh(snapshot),
+        )
+
+    def _terminal_goal_data_fresh(self, snapshot: PlannerSnapshot) -> bool:
+        return terminal_goal_data_fresh(
+            self._belief_age(snapshot),
+            self._parameter("belief_timeout"),
+            snapshot.velocity_fresh,
+            self._mission_goal_valid(snapshot),
         )
 
     def _control_at(self, absolute_time: float) -> np.ndarray:
@@ -429,11 +452,9 @@ class UTOPlannerNode(Node):
         return np.array([9.81, 0.0, 0.0, 0.0])
 
     def _make_request(self, snapshot: PlannerSnapshot, first: bool) -> PlanningRequest:
-        if not self._data_fresh(snapshot) or snapshot.belief is None or snapshot.path is None:
+        if not self._planning_data_fresh(snapshot) or snapshot.belief is None or snapshot.path is None:
             raise ValueError("cannot plan from stale snapshot")
-        delay = self.delay.estimate()
-        if first:
-            delay = max(delay, self._parameter("cold_start_delay"))
+        delay = self.delay.estimate(first, self._parameter("cold_start_delay"))
         commit_time = snapshot.now + delay
         sigma, mean, rotation, covariance = self.delay.propagate(
             snapshot.belief.sigma_states,
@@ -519,6 +540,8 @@ class UTOPlannerNode(Node):
             dense_gate_time=gate.elapsed,
             worker_completion_time=completed,
             worker_total_time=completed - worker_start,
+            cold_build_time=self.nlp.build_time,
+            nlp_build_count=self.nlp.build_count,
         )
         return WorkerResult(result, gate, timing)
 
@@ -588,7 +611,7 @@ class UTOPlannerNode(Node):
             self.manager.deadline_misses += 1
             self.first_request_submitted = False
             return CommitOutcome.LATE
-        if snapshot.belief is None or not self._data_fresh(snapshot):
+        if snapshot.belief is None or not self._planning_data_fresh(snapshot):
             self.buffer.discard_candidate()
             self.first_request_submitted = False
             return CommitOutcome.REJECTED
@@ -615,7 +638,12 @@ class UTOPlannerNode(Node):
 
     def _goal_conditions(self, snapshot: PlannerSnapshot) -> bool:
         goal = snapshot.mission_goal
-        if snapshot.belief is None or goal is None or self.buffer.active is None:
+        if (
+            snapshot.belief is None
+            or goal is None
+            or self.buffer.active is None
+            or not self._terminal_goal_data_fresh(snapshot)
+        ):
             return False
         timeout = self._parameter("mission_goal_timeout")
         if timeout > 0.0 and not 0.0 <= snapshot.now - goal.stamp <= timeout:
@@ -631,6 +659,9 @@ class UTOPlannerNode(Node):
 
     def _update_goal(self, snapshot: PlannerSnapshot) -> None:
         if self.state not in (PlannerState.EXECUTING, PlannerState.REPLANNING):
+            self.goal_since = None
+            return
+        if not self._terminal_goal_data_fresh(snapshot) or snapshot.px4.get("failsafe"):
             self.goal_since = None
             return
         self.goal_since, reached = update_goal_dwell(
@@ -650,13 +681,15 @@ class UTOPlannerNode(Node):
 
     def _on_resume(self, request, response):
         snapshot = self._snapshot()
-        restart_goal = (
-            self.state == PlannerState.GOAL_REACHED
-            and self.goal_restart_pending
-            and snapshot.mission_goal is not None
-            and snapshot.px4.get("connected")
-            and snapshot.px4.get("hold_ready")
-            and not snapshot.px4.get("failsafe")
+        restart_goal = can_restart_mission(
+            self.state,
+            self.goal_restart_pending,
+            snapshot.px4,
+            self._mission_goal_valid(snapshot),
+            snapshot.belief is not None,
+            snapshot.belief_stable,
+            snapshot.velocity_fresh,
+            self._path_fresh(snapshot),
         )
         allowed = can_resume(
             self.state,
@@ -669,8 +702,10 @@ class UTOPlannerNode(Node):
         response.success = allowed
         if allowed:
             self.goal_restart_pending = False
+            self.goal_since = None
+            self.buffer.discard_candidate()
             self.first_request_submitted = False
-            self.state = PlannerState.WAIT_IFDS_INITIAL_PATH
+            self.state = PlannerState.WAIT_BELIEF_STABLE
             response.message = "resume accepted; belief and path will be revalidated"
         else:
             response.message = "resume rejected: FAULT or readiness conditions not met"
@@ -678,16 +713,30 @@ class UTOPlannerNode(Node):
 
     def _publish_diagnostics(self, reason: str = "", level: str = "OK") -> None:
         gate = self.last_gate
+        first_delay = self.buffer.active is None and self.state in (
+            PlannerState.BUILDING_NLP,
+            PlannerState.FIRST_SOLVE,
+            PlannerState.TRAJECTORY_READY,
+        )
+        projection = self.delay.last_projection
         payload = {
             "state": self.state.name,
             "level": level,
             "reason": reason,
-            "cold_build_time": self.nlp.build_time,
-            "parameter_update_time": self.nlp.parameter_update_time,
-            "solve_time": self.nlp.solve_time,
-            "solve_p90": self.delay.percentile90(),
-            "estimated_planning_delay": self.delay.estimate(),
-            "delay_estimate_mode": self.delay.estimate_mode,
+            "cold_build_time": self.last_timing.cold_build_time if self.last_timing else 0.0,
+            "parameter_update_time": self.last_timing.nlp_prepare_time if self.last_timing else 0.0,
+            "solve_time": self.last_timing.ipopt_solve_time if self.last_timing else 0.0,
+            "solve_p90": self.delay.percentile90(),  # deprecated compatibility field
+            "admission_latency_p90": self.delay.percentile90(),
+            "estimated_planning_delay": self.delay.estimate(
+                first_delay, self._parameter("cold_start_delay")
+            ),
+            "delay_estimate_mode": self.delay.estimate_mode(first_delay),
+            "latency_sample_count": len(self.delay.samples),
+            "latency_window_size": self.delay.window,
+            "latency_min_samples": self.delay.minimum_samples,
+            "cold_start_delay": self._parameter("cold_start_delay"),
+            "initial_delay": self._parameter("initial_delay"),
             "queue_time": (
                 self.last_timing.worker_start_time - self.last_timing.enqueue_time
                 if self.last_timing
@@ -702,7 +751,7 @@ class UTOPlannerNode(Node):
             "request_to_commit_time": self.last_request_to_commit_time,
             "deadline_miss_count": self.manager.deadline_misses,
             "stale_candidate_discard_count": self.manager.stale_discards,
-            "nlp_build_count": self.nlp.build_count,
+            "nlp_build_count": self.last_timing.nlp_build_count if self.last_timing else 0,
             "active_trajectory_remaining": self.buffer.remaining(self._now()),
             "commit_lateness": self.last_commit_lateness,
             "actual_commit_error": self.last_commit_errors,
@@ -718,6 +767,9 @@ class UTOPlannerNode(Node):
             "mission_goal_generation": (
                 self.mission_goal.generation if self.mission_goal else None
             ),
+            "mission_goal_yaw_enabled": self._parameter("goal_yaw_enabled"),
+            "mission_goal_has_yaw": self.mission_goal is not None
+            and self.mission_goal.yaw is not None,
             "candidate_path_generation": (
                 self.buffer.candidate.path_generation if self.buffer.candidate else None
             ),
@@ -740,6 +792,18 @@ class UTOPlannerNode(Node):
             ),
             "first_request_submitted": self.first_request_submitted,
             "solve_in_progress": self.solve_in_progress,
+            "sigma_projection": (
+                {
+                    "relative_covariance_error": projection.relative_covariance_error,
+                    "position_velocity_cross_error": projection.position_velocity_cross_error,
+                    "attitude_velocity_cross_error": projection.attitude_velocity_cross_error,
+                    "target_rank": projection.target_rank,
+                    "reconstructed_rank": projection.reconstructed_rank,
+                    "discarded_eigenvalue_energy": projection.discarded_eigenvalue_energy,
+                }
+                if projection
+                else None
+            ),
         }
         self.diagnostics_pub.publish(String(data=json.dumps(payload)))
 

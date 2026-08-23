@@ -33,6 +33,7 @@ uto_planner:
     initial_delay: 0.50
     cold_start_delay: 1.20
     delay_p90_window: 20
+    delay_p90_min_samples: 5
     minimum_delay: 0.20
     maximum_delay: 1.50
     validation_time: 0.02

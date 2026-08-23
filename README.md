@@ -31,13 +31,15 @@ Worker线程是唯一CasADi/IPOPT owner，负责set parameters、solve、extract
 
 Candidate允许的commit lateness由`allowed_commit_lateness`限制；超过阈值会拒绝，避免从trajectory中间开始。每次高频tick先drain completion、取得一致snapshot，再优先处理due candidate；仅在没有成功commit时才判定旧active是否过期。一个tick只会选择`commit / continue / safe hold / goal reached`之一，避免同周期先hold再发trajectory。通过gate的candidate只留在planner本地，到commit时用最新belief检查position、velocity和SO(3) geodesic attitude error，成功后才发布给bridge。Global mode的active path generation也只在成功commit后更新。
 
+决策优先级为：`COMMITTED → COMMIT`、`GOAL_REACHED → GOAL_REACHED`、fresh `WAITING → CONTINUE`、stale `WAITING → SAFE_HOLD`、合法且terminal-data-fresh的goal dwell → `CONTINUE`，最后才按active tail和planning freshness选择continue或hold。尤其first candidate尚未due且active为空时继续PX4 takeoff/terminal hold，不会提前进入`SAFE_HOLD`；late/rejected candidate且无active tail仍会安全hold。
+
 ## Belief、delay和时间域
 
 FAST-LIO `/Odometry`读取position、quaternion、ROS timestamp和完整6×6 position/attitude-tangent covariance，保留cross terms并执行finite、all-zero、PSD、eigen-floor和inflation检查。Stable detector使用position Euclidean变化、`Log(R_previousᵀR_current)` attitude变化及covariance变化，所以`179°→-179°`不会被误判为358°跳变。Conversion、frame、quaternion、covariance或velocity失败会立即清除stable状态。
 
-Delay从belief timestamp开始，以相同绝对时钟查询active controls并用RK4传播七条sigma trajectories。传播后在`[position, velocity, Log(R_mean^T R_i)]`的9维联合tangent space计算均值、covariance和原始simplex vertex identity。`Q=0`时原始七条trajectory完全不重采样；`Q>0`时只把规定的pose process-noise block加入联合covariance，并用原latent vertex basis作PSD factor update，因此保留动力学产生的position–velocity及attitude–velocity cross terms，而不是按新旧数组索引拼接velocity。`commit_time < belief_stamp`或clock非finite会拒绝request。
+Delay从belief timestamp开始，以相同绝对时钟查询active controls并用RK4传播七条sigma trajectories。传播后在`[position, velocity, Log(R_mean^T R_i)]`的9维联合tangent space计算均值、covariance和原始simplex vertex identity。`Q=0`时原始七条trajectory完全不重采样，完整tangent covariance保持不变。七个等权centered sigma最多只有rank 6；`Q>0`后九维target一般高于rank 6，因此代码明确执行最佳rank-6 PSD近似，而不声称精确恢复target。Diagnostics量化relative Frobenius covariance error、position–velocity/attitude–velocity cross-block error、target/reconstructed rank及discarded eigenvalue energy；cross terms不会被静默清零。`commit_time < belief_stamp`或clock非finite会拒绝request。
 
-Delay历史记录的是实际admission latency，而不只是IPOPT时间：request enqueue → worker queue → build/parameter prepare → IPOPT → extraction → dense gate → completion queue consumption；成功commit后另记request-to-commit。窗口满前用`cold_start_delay`，之后使用固定窗口、先按`latency_clip_min/max`裁剪的P90，再加入`validation_time + commit_margin + commit_scheduling_margin`并限制到`minimum_delay/maximum_delay`。Diagnostics分别发布`queue_time`、`nlp_prepare_time`、`ipopt_solve_time`、`extraction_time`、`dense_gate_time`、`worker_total_time`、`completion_queue_time`、`request_to_commit_time`、估计delay及cold/P90模式。
+Delay历史记录的是实际admission latency，而不只是IPOPT时间：request enqueue → worker queue → build/parameter prepare → IPOPT → extraction → dense gate → completion queue consumption；成功commit后另记request-to-commit。`first_cold`显式使用`cold_start_delay=1.2 s`；first solve后、有效样本少于`delay_p90_min_samples=5`时为`initial_history`并使用`initial_delay=0.5 s`；达到门槛后才进入`steady_p90`。History最多`delay_p90_window=20`个样本并先按`latency_clip_min/max`裁剪。`validation_time`是额外固定安全overhead，不是dense gate实测时间（dense gate已包含在admission sample内）；之后再加commit/interface scheduling margins并限制到minimum/maximum delay。Diagnostics使用`admission_latency_p90`，旧`solve_p90`仅作deprecated兼容。
 
 PX4 `VehicleOdometry.timestamp_sample`存在时优先使用，否则使用`timestamp`。`px4_velocity_time_mode=offset`显式估计PX4→ROS offset并监测offset跳变；`ros`模式要求timestamp已在ROS `/clock`域。超过`source_clock_tolerance`的变化使velocity invalid。Diagnostics发布belief/path/velocity age和velocity clock offset。IFDS path的header stamp必须非零，且每次有效dynamic update必须更新ROS timestamp。
 
@@ -53,7 +55,9 @@ Admission先检查真实LGR residual和collocation output，再独立执行每re
 
 `/ifds/local_path`只提供滚动lookahead，末点绝不是全局任务终点。IFDS须用`geometry_msgs/PoseStamped`在`/ifds/mission_goal`为每个任务发布一次显式goal；timestamp必须非零、frame必须等于planning frame、position/orientation必须finite。默认`mission_goal_timeout=0`表示收到后持久有效；正值才启用freshness timeout。内容generation变化会清除旧dwell，重复发布相同goal或滚动local path不会重置它。
 
-Active/terminal trajectory结束后，最新belief必须连续`goal_dwell_time`满足显式goal的position、velocity，以及可选的wrapped-yaw tolerance，才进入`GOAL_REACHED`；否则trajectory过期进入`SAFE_HOLD`。Goal reached后停止普通replanning并保持bridge terminal hold。新goal到达只设置保守restart-pending，需调用`/uto/resume`且PX4/hold/fresh data健康后才开始新任务。
+Active/terminal trajectory结束后，最新belief必须连续`goal_dwell_time`满足显式goal的position、velocity，以及可选的wrapped-yaw tolerance，才进入`GOAL_REACHED`。Terminal goal freshness只要求fresh belief、fresh velocity和有效persistent mission goal，不要求rolling local path继续更新；belief/velocity stale会立即清空dwell，PX4 failsafe优先。Goal reached后停止普通replanning并保持bridge terminal hold。
+
+`goal_yaw_enabled=false`时goal可为position-only，零/未设置quaternion被接受，generation只取position且orientation变化不会重置dwell。启用yaw后quaternion必须finite、nonzero、可归一化，generation包含wrapped yaw。新goal到达`GOAL_REACHED`只设置restart-pending；`/uto/resume`还必须验证PX4 connected/hold-ready/no-failsafe、goal valid、belief present且stable、velocity和local path fresh。成功后清除旧candidate/dwell、保留旧active terminal hold，并从`WAIT_BELIEF_STABLE`重新走startup readiness，直到新trajectory commit才替换hold reference。
 
 Trajectory JSON (`uto_trajectory/v1`)验证time/state/control/covariance shape、finite和monotonic。Yaw插值先unwrap再wrap，避免`+π/-π`走长路径。正常结束hold最终trajectory position/yaw；emergency hold保持最后实际安全setpoint，不回起飞点，不外推过期trajectory。
 

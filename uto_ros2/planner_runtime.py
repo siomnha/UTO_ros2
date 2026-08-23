@@ -74,6 +74,8 @@ class TimingBreakdown:
     dense_gate_time: float
     worker_completion_time: float
     worker_total_time: float
+    cold_build_time: float = 0.0
+    nlp_build_count: int = 0
 
     def __post_init__(self):
         values = (
@@ -85,6 +87,8 @@ class TimingBreakdown:
             self.dense_gate_time,
             self.worker_completion_time,
             self.worker_total_time,
+            self.cold_build_time,
+            self.nlp_build_count,
         )
         if not all(np.isfinite(value) and value >= 0.0 for value in values):
             raise ValueError("timing values must be finite and nonnegative")
@@ -289,8 +293,9 @@ class DelayPredictor:
 
     def __init__(
         self,
-        default: float,
+        initial: float,
         window: int,
+        minimum_samples: int,
         minimum: float,
         maximum: float,
         validation: float,
@@ -299,8 +304,28 @@ class DelayPredictor:
         latency_clip_min: float = 0.0,
         latency_clip_max: float = 2.0,
     ) -> None:
+        numeric = (
+            initial,
+            minimum,
+            maximum,
+            validation,
+            margin,
+            scheduling_margin,
+            latency_clip_min,
+            latency_clip_max,
+        )
+        if not all(np.isfinite(value) and value >= 0.0 for value in numeric):
+            raise ValueError("delay parameters must be finite and nonnegative")
+        if minimum > maximum:
+            raise ValueError("minimum delay exceeds maximum delay")
+        if window < 1 or minimum_samples < 1 or minimum_samples > window:
+            raise ValueError("delay minimum samples must be in [1, window]")
+        if not 0.0 <= latency_clip_min <= latency_clip_max:
+            raise ValueError("invalid latency clipping range")
         self.samples = deque(maxlen=window)
-        self.default = default
+        self.initial = initial
+        self.window = window
+        self.minimum_samples = minimum_samples
         self.minimum = minimum
         self.maximum = maximum
         self.validation = validation
@@ -308,6 +333,7 @@ class DelayPredictor:
         self.scheduling_margin = scheduling_margin
         self.latency_clip_min = latency_clip_min
         self.latency_clip_max = latency_clip_max
+        self.last_projection = None
 
     def record_latency(self, elapsed: float) -> None:
         if not np.isfinite(elapsed) or elapsed < 0.0:
@@ -318,19 +344,21 @@ class DelayPredictor:
         """Backward-compatible alias; values now mean full admission latency."""
         self.record_latency(elapsed)
 
-    @property
-    def estimate_mode(self) -> str:
-        return "steady_p90" if len(self.samples) >= 3 else "cold"
+    def estimate_mode(self, first: bool = False) -> str:
+        if first:
+            return "first_cold"
+        return "steady_p90" if len(self.samples) >= self.minimum_samples else "initial_history"
 
     def percentile90(self) -> float:
-        if len(self.samples) < 3:
-            return self.default
+        if len(self.samples) < self.minimum_samples:
+            return self.initial
         return float(np.percentile(self.samples, 90))
 
-    def estimate(self) -> float:
+    def estimate(self, first: bool = False, cold_start_delay: float = 0.0) -> float:
+        base = cold_start_delay if first else self.percentile90()
         return float(
             np.clip(
-                self.percentile90() + self.validation + self.margin + self.scheduling_margin,
+                base + self.validation + self.margin + self.scheduling_margin,
                 self.minimum,
                 self.maximum,
             )
@@ -365,7 +393,14 @@ class DelayPredictor:
         if process.shape != (6,):
             raise ValueError("delay process noise must have 6 or 9 diagonal entries")
         pose_process = np.diag(process) * duration
-        return joint_sigma_process_update(propagated, pose_process)
+        projection = joint_sigma_process_update(propagated, pose_process)
+        self.last_projection = projection.diagnostics
+        return (
+            projection.sigma_states,
+            projection.mean_state,
+            projection.mean_rotation,
+            projection.covariance,
+        )
 
 
 @dataclass(frozen=True)
@@ -481,15 +516,18 @@ def execution_decision(
     active_remaining: float,
     goal_reached: bool,
     goal_dwell_pending: bool = False,
+    terminal_goal_data_fresh: bool = False,
 ) -> ExecutionDecision:
     """Resolve one mutually exclusive execution action for a commit tick."""
     if outcome == CommitOutcome.COMMITTED:
         return ExecutionDecision.COMMIT
     if goal_reached:
         return ExecutionDecision.GOAL_REACHED
+    if outcome == CommitOutcome.WAITING:
+        return ExecutionDecision.CONTINUE if data_fresh else ExecutionDecision.SAFE_HOLD
     # An expired terminal trajectory is still a valid terminal-hold semantic
     # while an explicitly supplied mission goal is accumulating dwell time.
-    if goal_dwell_pending:
+    if goal_dwell_pending and terminal_goal_data_fresh:
         return ExecutionDecision.CONTINUE
     if not data_fresh or active_remaining <= 0.0:
         return ExecutionDecision.SAFE_HOLD
@@ -530,6 +568,8 @@ def mission_goal_satisfied(
     velocity_ok = np.linalg.norm(belief.velocity) <= velocity_tolerance
     if not yaw_enabled:
         return bool(position_ok and velocity_ok)
+    if goal.yaw is None:
+        return False
     yaw_error = abs(
         np.arctan2(
             np.sin(belief.mean_state[8] - goal.yaw),
@@ -537,6 +577,57 @@ def mission_goal_satisfied(
         )
     )
     return bool(position_ok and velocity_ok and yaw_error <= yaw_tolerance)
+
+
+def mission_goal_yaw_and_generation(position, quaternion_xyzw, yaw_enabled: bool):
+    """Parse an optional goal yaw and create a semantic content generation."""
+    position = np.asarray(position, dtype=float)
+    position_key = tuple(float(value) for value in position)
+    if not yaw_enabled:
+        return None, ",".join(f"{value:.6f}" for value in position_key)
+    from .math_utils import quat_to_rot, rot_to_euler
+
+    yaw = float(rot_to_euler(quat_to_rot(quaternion_xyzw))[2])
+    yaw = float(np.arctan2(np.sin(yaw), np.cos(yaw)))
+    generation = ",".join(f"{value:.6f}" for value in (*position_key, yaw))
+    return yaw, generation
+
+
+def planning_data_fresh(belief_age: float, belief_timeout: float, velocity_fresh: bool, path_fresh: bool):
+    return bool(0.0 <= belief_age <= belief_timeout and velocity_fresh and path_fresh)
+
+
+def terminal_goal_data_fresh(
+    belief_age: float,
+    belief_timeout: float,
+    velocity_fresh: bool,
+    goal_valid: bool,
+):
+    return bool(0.0 <= belief_age <= belief_timeout and velocity_fresh and goal_valid)
+
+
+def can_restart_mission(
+    state: PlannerState,
+    restart_pending: bool,
+    px4: dict,
+    goal_valid: bool,
+    belief_present: bool,
+    belief_stable: bool,
+    velocity_fresh: bool,
+    path_fresh: bool,
+) -> bool:
+    return bool(
+        state == PlannerState.GOAL_REACHED
+        and restart_pending
+        and px4.get("connected")
+        and px4.get("hold_ready")
+        and not px4.get("failsafe")
+        and goal_valid
+        and belief_present
+        and belief_stable
+        and velocity_fresh
+        and path_fresh
+    )
 
 
 def commit_due_status(now: float, candidate: Trajectory, allowed_lateness: float) -> tuple:
@@ -751,6 +842,7 @@ PLANNER_PARAMETER_DEFAULTS = {
     "initial_delay": 0.5,
     "cold_start_delay": 1.2,
     "delay_p90_window": 20,
+    "delay_p90_min_samples": 5,
     "minimum_delay": 0.2,
     "maximum_delay": 1.5,
     "validation_time": 0.02,
@@ -829,6 +921,7 @@ def build_runtime_components(parameter: Callable[[str], object]) -> RuntimeCompo
     delay = DelayPredictor(
         parameter("initial_delay"),
         parameter("delay_p90_window"),
+        parameter("delay_p90_min_samples"),
         parameter("minimum_delay"),
         parameter("maximum_delay"),
         parameter("validation_time"),
