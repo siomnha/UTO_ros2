@@ -12,6 +12,13 @@ def already_at_mission_goal(start, goal, tolerance=1e-9) -> bool:
                 and np.linalg.norm(start - goal) <= tolerance)
 
 
+def static_ifds_replan_requested(
+    goal_present: bool, plan_once_static: bool, static_path_planned: bool
+) -> bool:
+    """Do not rerun static IFDS for ordinary odometry after its first valid path."""
+    return bool(goal_present and not (plan_once_static and static_path_planned))
+
+
 class Polyline:
     def __init__(self, points):
         self.p = np.asarray(points, float).reshape(-1, 3)
@@ -42,6 +49,21 @@ class Polyline:
     def lookahead(self, q, count, spacing):
         s, _, _ = self.project(q)
         return np.array([self.at(s + i * spacing) for i in range(count)])
+
+    def full_mission_references(self, q, count, spacing):
+        """Return fixed-size references spanning the remaining path through its endpoint."""
+        if count < 2 or spacing <= 0.0:
+            raise ValueError("full mission references require count >= 2 and positive spacing")
+        start, _, _ = self.project(q)
+        remaining = self.s[-1] - start
+        coverage = (count - 1) * spacing
+        if remaining <= coverage:
+            samples = np.minimum(start + np.arange(count) * spacing, self.s[-1])
+        else:
+            samples = np.linspace(start, self.s[-1], count)
+        references = np.array([self.at(value) for value in samples])
+        references[-1] = self.p[-1]
+        return references
 
 
 def path_generation(stamp_or_points, points=None, resolution=0.05):

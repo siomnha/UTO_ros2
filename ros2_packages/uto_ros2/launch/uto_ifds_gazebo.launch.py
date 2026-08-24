@@ -18,14 +18,20 @@ def _nodes(context):
         ifds_params = os.path.join(share, "config", f"ifds_{mode}.yaml")
     obstacles = LaunchConfiguration("ifds_obstacles").perform(context)
     if not obstacles:
-        obstacles = os.path.join(
-            share, "config", f"corridor_{'dynamic' if mode == 'online' else 'static'}_4_obstacles.yaml"
+        obstacle_name = (
+            "corridor_dynamic_4_obstacles.yaml"
+            if mode == "online"
+            else "simple_obstacles.yaml"
         )
+        obstacles = os.path.join(share, "config", obstacle_name)
     world = LaunchConfiguration("world_sdf").perform(context)
     if not world:
-        world = os.path.join(
-            share, "worlds", f"my_rgl_corridor_{'dynamic' if mode == 'online' else 'static'}_4.sdf"
+        world_name = (
+            "my_rgl_corridor_dynamic_4.sdf"
+            if mode == "online"
+            else "my_rgl_simple.sdf"
         )
+        world = os.path.join(share, "worlds", world_name)
     uto_common = {"use_sim_time": True, "planning_frame": "map"}
     return [
         Node(

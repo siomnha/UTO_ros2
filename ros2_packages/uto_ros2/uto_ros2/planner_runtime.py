@@ -104,6 +104,77 @@ class PlanningRequest:
     path: Polyline
     first: bool = False
     enqueue_monotonic: float = 0.0
+    terminal_segment: bool = False
+    commit_time_finalized: bool = True
+
+
+def terminal_segment_matches_goal(
+    references, mission_goal_position, tolerance: float
+) -> bool:
+    """Identify a final segment from the explicit mission goal, never spacing heuristics."""
+    if mission_goal_position is None or tolerance < 0.0:
+        return False
+    references = np.asarray(references, dtype=float)
+    goal = np.asarray(mission_goal_position, dtype=float)
+    return bool(
+        references.ndim == 2
+        and len(references) > 0
+        and goal.shape == (3,)
+        and np.all(np.isfinite(references[-1]))
+        and np.all(np.isfinite(goal))
+        and np.linalg.norm(references[-1] - goal) <= tolerance
+    )
+
+
+def global_preflight_ready(
+    px4: dict,
+    belief_stable: bool,
+    path_fresh: bool,
+    mission_goal_valid: bool,
+) -> bool:
+    """Require the aircraft to be connected and holding before a global solve."""
+    return bool(
+        px4.get("connected")
+        and px4.get("hold_ready")
+        and not px4.get("failsafe")
+        and belief_stable
+        and path_fresh
+        and mission_goal_valid
+    )
+
+
+def select_planning_initial_state(belief, delay_enabled: bool, delayed_factory):
+    """Freeze the current belief when delay compensation is disabled."""
+    if delay_enabled:
+        return delayed_factory()
+    return (
+        belief.sigma_states.copy(),
+        belief.mean_state.copy(),
+        belief.rotation.copy(),
+        belief.covariance.copy(),
+    )
+
+
+def global_post_solve_commit_time(completion_time: float, lead_time: float) -> float:
+    """Schedule a global trajectory only after solve/gate completion."""
+    if not np.isfinite(completion_time) or not np.isfinite(lead_time) or lead_time < 0.0:
+        raise ValueError("global commit time inputs must be finite and lead must be nonnegative")
+    return float(completion_time + lead_time)
+
+
+def global_one_shot_plan_allowed(trajectory_committed: bool) -> bool:
+    """A new mission resets the flag; a committed mission cannot replan in flight."""
+    return not trajectory_committed
+
+
+def px4_status_payload(**values) -> dict:
+    """Normalize bridge diagnostics to JSON-safe scalar values."""
+    payload = {}
+    for key, value in values.items():
+        if isinstance(value, np.generic):
+            value = value.item()
+        payload[str(key)] = value
+    return payload
 
 
 @dataclass(frozen=True)
@@ -534,6 +605,8 @@ class CandidateManager:
         if request.request_generation != current_generation:
             self.stale_discards += 1
             return False, "stale"
+        if not request.commit_time_finalized:
+            return False, "commit time not finalized"
         if now > request.commit_time - self.guard:
             self.deadline_misses += 1
             return False, "late"
@@ -699,6 +772,15 @@ def commit_continuity_errors(candidate: Trajectory, belief) -> tuple:
     return position, velocity, attitude
 
 
+def commit_continuity_accepted(candidate: Trajectory, belief, tolerances) -> tuple:
+    """Return continuity admission and its position/velocity/SO(3) errors."""
+    errors = commit_continuity_errors(candidate, belief)
+    tolerances = tuple(float(value) for value in tolerances)
+    if len(tolerances) != 3:
+        raise ValueError("commit continuity requires three tolerances")
+    return all(error <= tolerance for error, tolerance in zip(errors, tolerances)), errors
+
+
 def can_resume(
     state: PlannerState, px4: dict, belief_stable: bool, velocity_fresh: bool, path_fresh: bool
 ) -> bool:
@@ -853,6 +935,14 @@ PLANNER_PARAMETER_DEFAULTS = {
     "resume_service": "/uto/resume",
     "planning_frame": "map",
     "mode": "online",
+    "global_one_shot": False,
+    "global_replan_enabled": True,
+    "delay_compensation_enabled": True,
+    "global_commit_lead_time": 0.10,
+    "global_preflight_retry_enabled": True,
+    "global_preflight_max_attempts": 3,
+    "global_preflight_retry_period": 0.5,
+    "terminal_goal_match_tolerance": 0.10,
     "velocity_source": "patched_odometry_twist",
     "velocity_frame_alignment_mode": "identity",
     "velocity_frame_yaw_offset": 0.0,

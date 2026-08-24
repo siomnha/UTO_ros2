@@ -11,8 +11,9 @@ ifds_planner:
     path_topic: /ifds/local_path
     path_status_topic: /ifds/path_status
     obstacle_updates_topic: /ifds/obstacles
+    plan_once_static: true
     planning_rate_hz: 2.0
-    path_validity_duration: 0.8
+    path_validity_duration: 30.0
     tf_timeout: 0.1
     allow_empty_obstacles: false
     validate_world_consistency: true

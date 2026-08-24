@@ -1,6 +1,6 @@
 """ROS wiring for belief/path snapshots, background solve, admission, and commit."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import threading
 import time
@@ -35,7 +35,7 @@ from .planner_runtime import (
     build_runtime_components,
     can_restart_mission,
     can_resume,
-    commit_continuity_errors,
+    commit_continuity_accepted,
     commit_due_status,
     execution_decision,
     goal_generation_changed,
@@ -44,6 +44,11 @@ from .planner_runtime import (
     mission_goal_yaw_and_generation,
     planning_data_fresh,
     terminal_goal_data_fresh,
+    terminal_segment_matches_goal,
+    global_preflight_ready,
+    global_post_solve_commit_time,
+    global_one_shot_plan_allowed,
+    select_planning_initial_state,
     invalid_ifds_path_requires_hold,
     ifds_no_path_transition,
     update_goal_dwell,
@@ -105,12 +110,21 @@ class UTOPlannerNode(Node):
         self.candidate_request_time = None
         self.pending_safety_reason = ""
         self.goal_since = None
+        self.global_preflight_attempt = 0
+        self.global_last_attempt_time = -np.inf
+        self.global_trajectory_committed = False
+        self.global_replan_blocked = False
+        self.planning_initial_state_source = "delay_compensated_belief"
+        self.commit_policy = "predicted_commit_time"
+        self.full_mission_reference_count = 0
+        self.full_mission_reference_length = 0.0
         self._build_components()
         self._create_interfaces()
 
     def _declare_parameters(self) -> None:
         for name, value in PLANNER_PARAMETER_DEFAULTS.items():
-            self.declare_parameter(name, value)
+            if not self.has_parameter(name):
+                self.declare_parameter(name, value)
 
     def _parameter(self, name):
         return self.get_parameter(name).value
@@ -434,6 +448,13 @@ class UTOPlannerNode(Node):
             if changed:
                 self.goal_since = None
                 self.goal_restart_pending = self.state == PlannerState.GOAL_REACHED
+                self.global_preflight_attempt = 0
+                self.global_last_attempt_time = -np.inf
+                self.global_trajectory_committed = False
+                self.global_replan_blocked = False
+                if self._global_one_shot_mode() and self.state == PlannerState.GOAL_REACHED:
+                    self.state = PlannerState.HOLD
+                    self.goal_restart_pending = False
         if changed:
             self._invalidate_planning_for_mission_goal()
 
@@ -511,6 +532,9 @@ class UTOPlannerNode(Node):
             if self.worker.submit(request, replace_pending=not first):
                 self.solve_in_progress = True
                 if first:
+                    if self._global_one_shot_mode():
+                        self.global_preflight_attempt += 1
+                        self.global_last_attempt_time = snapshot.now
                     self.first_request_submitted = True
                     self.state = PlannerState.FIRST_SOLVE
                 else:
@@ -602,11 +626,20 @@ class UTOPlannerNode(Node):
         return age >= 0.0 and (timeout <= 0.0 or age <= timeout)
 
     def _planning_data_fresh(self, snapshot: PlannerSnapshot) -> bool:
+        path_fresh = self._path_fresh(snapshot)
+        if self._global_one_shot_mode() and self.global_trajectory_committed:
+            path_fresh = True
         return planning_data_fresh(
             self._belief_age(snapshot),
             self._parameter("belief_timeout"),
             snapshot.velocity_fresh,
-            self._path_fresh(snapshot),
+            path_fresh,
+        )
+
+    def _global_one_shot_mode(self) -> bool:
+        return bool(
+            self._parameter("mode") == "global"
+            and self._parameter("global_one_shot")
         )
 
     def _terminal_goal_data_fresh(self, snapshot: PlannerSnapshot) -> bool:
@@ -628,19 +661,59 @@ class UTOPlannerNode(Node):
     def _make_request(self, snapshot: PlannerSnapshot, first: bool) -> PlanningRequest:
         if not self._planning_data_fresh(snapshot) or snapshot.belief is None or snapshot.path is None:
             raise ValueError("cannot plan from stale snapshot")
-        delay = self.delay.estimate(first, self._parameter("cold_start_delay"))
-        commit_time = snapshot.now + delay
-        sigma, mean, rotation, covariance = self.delay.propagate(
-            snapshot.belief.sigma_states,
-            snapshot.belief.stamp,
-            commit_time,
-            self._control_at,
-            self._parameter("process_noise_diagonal"),
+        if not self._mission_goal_valid(snapshot):
+            raise ValueError("cannot plan without a valid mission goal")
+        delay_enabled = bool(self._parameter("delay_compensation_enabled"))
+        predicted_commit_time = snapshot.now
+        if delay_enabled:
+            delay = self.delay.estimate(first, self._parameter("cold_start_delay"))
+            predicted_commit_time = snapshot.now + delay
+        sigma, mean, rotation, covariance = select_planning_initial_state(
+            snapshot.belief,
+            delay_enabled,
+            lambda: self.delay.propagate(
+                snapshot.belief.sigma_states,
+                snapshot.belief.stamp,
+                predicted_commit_time,
+                self._control_at,
+                self._parameter("process_noise_diagonal"),
+            ),
         )
-        references = snapshot.path["polyline"].lookahead(
-            mean[:3],
-            self._parameter("lookahead_count"),
-            self._parameter("lookahead_spacing"),
+        if delay_enabled:
+            commit_time = predicted_commit_time
+            self.planning_initial_state_source = "delay_compensated_belief"
+            self.commit_policy = "predicted_commit_time"
+        else:
+            commit_time = snapshot.now
+            self.planning_initial_state_source = "current_hold_belief"
+            self.commit_policy = "post_solve_hold_continuity"
+        if self._global_one_shot_mode():
+            references = snapshot.path["polyline"].full_mission_references(
+                mean[:3],
+                self._parameter("lookahead_count"),
+                self._parameter("lookahead_spacing"),
+            )
+        else:
+            references = snapshot.path["polyline"].lookahead(
+                mean[:3],
+                self._parameter("lookahead_count"),
+                self._parameter("lookahead_spacing"),
+            )
+        if self._parameter("mode") == "global":
+            terminal_segment = terminal_segment_matches_goal(
+                references,
+                snapshot.mission_goal.position if snapshot.mission_goal else None,
+                self._parameter("terminal_goal_match_tolerance"),
+            )
+        else:
+            # Preserve the existing online-mode terminal classification.
+            terminal_segment = bool(
+                np.linalg.norm(references[-1] - references[0])
+                < self._parameter("lookahead_spacing")
+            )
+        self.full_mission_reference_count = len(references)
+        self.full_mission_reference_length = float(
+            np.sum(np.linalg.norm(np.diff(references, axis=0), axis=1))
         )
         with self.lock:
             self.request_generation += 1
@@ -659,12 +732,50 @@ class UTOPlannerNode(Node):
             snapshot.path["polyline"],
             first,
             time.perf_counter(),
+            terminal_segment,
+            delay_enabled,
         )
 
     def _should_request_plan(self, snapshot: PlannerSnapshot) -> bool:
+        if self._global_one_shot_mode():
+            if not global_one_shot_plan_allowed(self.global_trajectory_committed):
+                self.global_replan_blocked = True
+                return False
+            ready = global_preflight_ready(
+                snapshot.px4,
+                snapshot.belief_stable,
+                self._path_fresh(snapshot),
+                self._mission_goal_valid(snapshot),
+            )
+            if not ready:
+                return False
+            if self.solve_in_progress or self.first_request_submitted:
+                return False
+            if self.global_preflight_attempt > 0:
+                if not self._parameter("global_preflight_retry_enabled"):
+                    self.global_replan_blocked = True
+                    return False
+                if self.global_preflight_attempt >= self._parameter(
+                    "global_preflight_max_attempts"
+                ):
+                    self.global_replan_blocked = True
+                    return False
+                if snapshot.now - self.global_last_attempt_time < self._parameter(
+                    "global_preflight_retry_period"
+                ):
+                    return False
+            return self.state in (
+                PlannerState.BUILDING_NLP,
+                PlannerState.FIRST_SOLVE,
+            )
         if self.state in (PlannerState.BUILDING_NLP, PlannerState.FIRST_SOLVE):
             return not self.first_request_submitted and not self.solve_in_progress
         if self.state not in (PlannerState.EXECUTING, PlannerState.REPLANNING):
+            return False
+        if self._parameter("mode") == "global" and not self._parameter(
+            "global_replan_enabled"
+        ):
+            self.global_replan_blocked = True
             return False
         if self._parameter("mode") == "global":
             unchanged = snapshot.path and snapshot.path["generation"] == self.last_path_generation
@@ -677,10 +788,7 @@ class UTOPlannerNode(Node):
         prepare_start = worker_start
         self.nlp.build()
         terminal_tolerance = self._parameter("terminal_velocity_tolerance")
-        final_mode = int(
-            np.linalg.norm(request.references[-1] - request.references[0])
-            < self._parameter("lookahead_spacing")
-        )
+        final_mode = int(request.terminal_segment)
         velocity_reference = np.zeros(3)
         if not final_mode:
             velocity_reference = (request.references[-1] - request.references[-2]) / max(
@@ -760,6 +868,18 @@ class UTOPlannerNode(Node):
         gate = result.gate_result
         solve_result = result.solve_result
         self.last_gate = gate
+        post_solve_global = bool(
+            self._global_one_shot_mode()
+            and not self._parameter("delay_compensation_enabled")
+        )
+        if post_solve_global:
+            request = replace(
+                request,
+                commit_time=global_post_solve_commit_time(
+                    now, self._parameter("global_commit_lead_time")
+                ),
+                commit_time_finalized=True,
+            )
         accepted, reason = self.manager.admit(
             request,
             solve_result,
@@ -768,6 +888,28 @@ class UTOPlannerNode(Node):
             gate,
             self._parameter("planning_frame"),
         )
+        if accepted and post_solve_global:
+            snapshot = self._snapshot()
+            candidate = self.buffer.candidate
+            continuity_ok = bool(
+                candidate is not None
+                and snapshot.belief is not None
+                and self._planning_data_fresh(snapshot)
+            )
+            if continuity_ok:
+                tolerances = (
+                    self._parameter("commit_position_tolerance"),
+                    self._parameter("commit_velocity_tolerance"),
+                    self._parameter("commit_attitude_tolerance"),
+                )
+                continuity_ok, errors = commit_continuity_accepted(
+                    candidate, snapshot.belief, tolerances
+                )
+                self.last_commit_errors = errors
+            if not continuity_ok:
+                self.buffer.discard_candidate()
+                accepted = False
+                reason = "post-solve hold continuity failed"
         if accepted:
             self.candidate_request_time = request.request_time
             self.state = PlannerState.TRAJECTORY_READY if request.first else PlannerState.REPLANNING
@@ -801,14 +943,16 @@ class UTOPlannerNode(Node):
             self.buffer.discard_candidate()
             self.first_request_submitted = False
             return CommitOutcome.REJECTED
-        errors = commit_continuity_errors(candidate, snapshot.belief)
-        self.last_commit_errors = errors
         tolerances = (
             self._parameter("commit_position_tolerance"),
             self._parameter("commit_velocity_tolerance"),
             self._parameter("commit_attitude_tolerance"),
         )
-        if not all(error <= tolerance for error, tolerance in zip(errors, tolerances)):
+        continuity_ok, errors = commit_continuity_accepted(
+            candidate, snapshot.belief, tolerances
+        )
+        self.last_commit_errors = errors
+        if not continuity_ok:
             self.buffer.discard_candidate()
             self.first_request_submitted = False
             return CommitOutcome.REJECTED
@@ -821,6 +965,9 @@ class UTOPlannerNode(Node):
         self.candidate_request_time = None
         self.state = PlannerState.EXECUTING
         self.hold_current_requested = False
+        if self._global_one_shot_mode():
+            self.global_trajectory_committed = True
+            self.global_replan_blocked = True
         return CommitOutcome.COMMITTED
 
     def _goal_conditions(self, snapshot: PlannerSnapshot) -> bool:
@@ -915,6 +1062,16 @@ class UTOPlannerNode(Node):
         projection = self.delay.last_projection
         payload = {
             "state": self.state.name,
+            "global_one_shot": self._parameter("global_one_shot"),
+            "global_replan_enabled": self._parameter("global_replan_enabled"),
+            "delay_compensation_enabled": self._parameter("delay_compensation_enabled"),
+            "global_preflight_attempt": self.global_preflight_attempt,
+            "global_trajectory_committed": self.global_trajectory_committed,
+            "global_replan_blocked": self.global_replan_blocked,
+            "planning_initial_state_source": self.planning_initial_state_source,
+            "commit_policy": self.commit_policy,
+            "full_mission_reference_count": self.full_mission_reference_count,
+            "full_mission_reference_length": self.full_mission_reference_length,
             "level": level,
             "reason": reason,
             "cold_build_time": self.last_timing.cold_build_time if self.last_timing else 0.0,
@@ -922,10 +1079,16 @@ class UTOPlannerNode(Node):
             "solve_time": self.last_timing.ipopt_solve_time if self.last_timing else 0.0,
             "solve_p90": self.delay.percentile90(),  # deprecated compatibility field
             "admission_latency_p90": self.delay.percentile90(),
-            "estimated_planning_delay": self.delay.estimate(
-                first_delay, self._parameter("cold_start_delay")
+            "estimated_planning_delay": (
+                self.delay.estimate(first_delay, self._parameter("cold_start_delay"))
+                if self._parameter("delay_compensation_enabled")
+                else 0.0
             ),
-            "delay_estimate_mode": self.delay.estimate_mode(first_delay),
+            "delay_estimate_mode": (
+                self.delay.estimate_mode(first_delay)
+                if self._parameter("delay_compensation_enabled")
+                else "disabled"
+            ),
             "latency_sample_count": len(self.delay.samples),
             "latency_window_size": self.delay.window,
             "latency_min_samples": self.delay.minimum_samples,

@@ -16,7 +16,12 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from .dynamics import dynamics
 from .math_utils import enu_to_ned, yaw_enu_to_ned
-from .planner_runtime import CommandState, Px4CommandSequencer, offboard_control_flags
+from .planner_runtime import (
+    CommandState,
+    Px4CommandSequencer,
+    offboard_control_flags,
+    px4_status_payload,
+)
 from .trajectory import ExecutionSetpoint, Trajectory, TrajectoryExecution
 
 
@@ -70,7 +75,8 @@ class PX4OffboardBridge(Node):
             "target_component": 1,
         }
         for name, value in defaults.items():
-            self.declare_parameter(name, value)
+            if not self.has_parameter(name):
+                self.declare_parameter(name, value)
 
     def _parameter(self, name):
         return self.get_parameter(name).value
@@ -243,23 +249,23 @@ class PX4OffboardBridge(Node):
         self.setpoint_publish_count += 1
 
     def _publish_status(self, now: float, connected: bool, failsafe: bool) -> None:
-        payload = {
-            "connected": connected,
-            "hold_ready": self._hold_ready(),
-            "failsafe": failsafe,
-            "armed": self._armed(),
-            "offboard": self._offboard(),
-            "mode": self.sequencer.state.name,
-            "command_retries": self.sequencer.retries,
-            "command_fault": self.sequencer.fault_reason,
-            "setpoint_max_jitter": self.max_jitter,
-            "setpoint_publish_count": self.setpoint_publish_count,
-            "active_trajectory_remaining": (
+        payload = px4_status_payload(
+            connected=connected,
+            hold_ready=self._hold_ready(),
+            failsafe=failsafe,
+            armed=self._armed(),
+            offboard=self._offboard(),
+            mode=self.sequencer.state.name,
+            command_retries=self.sequencer.retries,
+            command_fault=self.sequencer.fault_reason,
+            setpoint_max_jitter=self.max_jitter,
+            setpoint_publish_count=self.setpoint_publish_count,
+            active_trajectory_remaining=(
                 self.execution.trajectory.remaining(now)
                 if self.execution.trajectory is not None
                 else 0.0
             ),
-        }
+        )
         self.state_pub.publish(String(data=json.dumps(payload)))
 
 

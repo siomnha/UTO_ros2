@@ -60,6 +60,9 @@ uto_planner:
     solver_tolerance: 2.0e-5
     solver_max_iterations: 900
     mode: online
+    global_one_shot: false
+    global_replan_enabled: true
+    delay_compensation_enabled: true
     velocity_source: px4_vehicle_odometry
     horizon: 3.0
     lookahead_spacing: 0.40

@@ -103,7 +103,7 @@ velocity, and mission goal.
 
 | Mode | IFDS params | obstacle YAML | world |
 |---|---|---|---|
-| `global` | `ifds_global.yaml`, static | `corridor_static_4_obstacles.yaml` | `my_rgl_corridor_static_4.sdf` |
+| `global` | `ifds_global.yaml`, one-shot static | `simple_obstacles.yaml` | `my_rgl_simple.sdf` |
 | `online` | `ifds_online.yaml`, dynamic | `corridor_dynamic_4_obstacles.yaml` | `my_rgl_corridor_dynamic_4.sdf` |
 
 Original `known_obstacles*.yaml` files are also installed. They support `wall` and
@@ -187,6 +187,59 @@ ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=global gnss_denied:=true
 ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online gnss_denied:=false uto_belief_topic:=/fusion/odometry
 ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=online gnss_denied:=true
 ```
+
+## Global one-shot simple environment
+
+`mode:=global` now defaults to `my_rgl_simple.sdf` and
+`simple_obstacles.yaml`: the mission starts near `[0, 0, 1.5]`, uses the original
+static IFDS around `static_obstacle_1` near `[5.32173, -0.210448, 1.0]`, and is
+intended for a goal near `[10, 0, 1.5]`. The configured six references at 2 m
+spacing cover the full 10 m path and clamp at the exact IFDS/mission endpoint.
+
+Global startup is deliberately preflight-only:
+
+```text
+PX4 READY at takeoff hold
+→ stable FAST-LIO belief + valid mission goal + valid static IFDS path
+→ freeze current hold belief (no delay propagation or delay process noise)
+→ build NLP → IPOPT → dense feasibility gate
+→ latest-hold-belief continuity check
+→ set commit time to now + 0.10 s
+→ publish and execute the complete trajectory
+→ no in-flight IPOPT replanning
+→ goal dwell and terminal hold
+```
+
+The bridge remains an independent 40 Hz hold publisher while build/solve/gate are
+running. A failed preflight solve can retry at most three times, no faster than
+0.5 s. After commit, ordinary odometry updates, trajectory remaining time, and
+the one-shot path timestamp do not cause replanning. A new mission resets the
+one-shot state; explicit invalid status, stale belief/velocity, or PX4 failsafe
+still causes hold/safety handling. Online mode retains delay compensation and
+latest-wins replanning.
+
+Example sequence after building and sourcing the workspace:
+
+```bash
+# Terminal 1: simple Gazebo world (then start PX4 SITL with your normal model command)
+gz sim -r "$(ros2 pkg prefix uto_ros2)/share/uto_ros2/worlds/my_rgl_simple.sdf"
+
+# Terminal 2: start RGL/Livox conversion and FAST-LIO2 using their deployment configs
+# Verify /Odometry publishes a nonzero 6-D position-attitude covariance.
+
+# Terminal 3: IFDS + one-shot UTO + PX4 bridge
+ros2 launch uto_ros2 uto_ifds_gazebo.launch.py mode:=global gnss_denied:=true
+
+# Wait for /uto/px4_status mode READY and stable-belief diagnostics, then:
+ros2 topic pub --once /ifds/goal geometry_msgs/msg/PoseStamped \
+  "{header: {frame_id: map}, pose: {position: {x: 10.0, y: 0.0, z: 1.5}, orientation: {w: 1.0}}}"
+
+ros2 topic echo /uto/diagnostics
+```
+
+The trajectory topic is published only after solver status, dense gate, and
+post-solve continuity all succeed. During flight, diagnostics report
+`global_trajectory_committed=true` and `global_replan_blocked=true`.
 
 Pure tests cover the original-core regression oracle, no-obstacle/wall/
 superellipsoid/dynamic/velocity/optimizer behavior, original YAML, SDF contracts,

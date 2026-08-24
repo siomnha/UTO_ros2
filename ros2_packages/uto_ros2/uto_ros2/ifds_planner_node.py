@@ -22,7 +22,11 @@ from .ifds_contract import (
     validate_obstacle_world,
 )
 from .ifds_core import IFDSConfig, IFDSPlanner, obstacle_from_mapping
-from .ifds_path_adapter import already_at_mission_goal, append_exact_ifds_goal
+from .ifds_path_adapter import (
+    already_at_mission_goal,
+    append_exact_ifds_goal,
+    static_ifds_replan_requested,
+)
 
 
 class IFDSPlannerNode(Node):
@@ -37,6 +41,7 @@ class IFDSPlannerNode(Node):
             "mission_goal_topic": "/ifds/mission_goal", "path_topic": "/ifds/local_path",
             "path_status_topic": "/ifds/path_status", "obstacle_updates_topic": "/ifds/obstacles",
             "obstacles_yaml": "", "planning_rate_hz": 2.0, "path_validity_duration": 0.8,
+            "plan_once_static": False,
             "tf_timeout": 0.1, "allow_empty_obstacles": False,
             "validate_world_consistency": False, "world_sdf": "",
             "path_geometry_change_threshold": 0.05, "path_resample_spacing": 0.10,
@@ -48,7 +53,8 @@ class IFDSPlannerNode(Node):
             "wall_influence_distance": 1.0,
         }
         for name, value in defaults.items():
-            self.declare_parameter(name, value)
+            if not self.has_parameter(name):
+                self.declare_parameter(name, value)
         if not self.get_parameter("planner_only").value:
             raise RuntimeError("uto_ros2 requires IFDS planner_only=true")
         self.frame = str(self.get_parameter("frame_id").value)
@@ -58,6 +64,7 @@ class IFDSPlannerNode(Node):
         self.goal_generation = 0
         self.obstacle_generation = 0
         self.replan_requested = False
+        self.static_path_planned = False
         self.obstacles = []
         self.map_valid = False
         self.semantic_generation = SemanticPathGeneration(
@@ -116,7 +123,12 @@ class IFDSPlannerNode(Node):
                 [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
                 message.header.frame_id, message.header.stamp,
             )
-            self.replan_requested = self.goal is not None
+            if static_ifds_replan_requested(
+                self.goal is not None,
+                bool(self._p("plan_once_static")),
+                self.static_path_planned,
+            ):
+                self.replan_requested = True
         except ValueError as exception:
             self.position = None
             self._invalidate(str(exception))
@@ -134,6 +146,7 @@ class IFDSPlannerNode(Node):
             return
         self.goal, self.goal_orientation = position, orientation
         self.goal_generation += 1
+        self.static_path_planned = False
         self.replan_requested = True
         self._invalidate("NEW_GOAL_PENDING")
         checked = PoseStamped()
@@ -184,6 +197,7 @@ class IFDSPlannerNode(Node):
             return
         self.obstacles, self.map_valid = obstacles, True
         self.obstacle_generation += 1
+        self.static_path_planned = False
         self.replan_requested = self.goal is not None and self.position is not None
 
     def _config(self) -> IFDSConfig:
@@ -204,6 +218,8 @@ class IFDSPlannerNode(Node):
             found, waypoints, reason = append_exact_ifds_goal(planner, waypoints, self.goal)
         if not found or len(waypoints) < 2 or not np.all(np.isfinite(waypoints)):
             self._invalidate(reason or "NO_VALID_IFDS_PATH")
+            if self._p("plan_once_static"):
+                self.replan_requested = True
             return
         stamp = self.get_clock().now().to_msg()
         if stamp.sec == 0 and stamp.nanosec == 0:
@@ -225,6 +241,7 @@ class IFDSPlannerNode(Node):
                             now + float(self._p("path_validity_duration")), reason)
         self.path_pub.publish(path)
         self.status_pub.publish(String(data=status.to_json()))
+        self.static_path_planned = bool(self._p("plan_once_static"))
 
     def _invalidate(self, reason: str, terminal: bool = False) -> None:
         status = PathStatus(False, 0, self.semantic_generation.generation,

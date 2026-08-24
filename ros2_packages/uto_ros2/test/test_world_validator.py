@@ -39,6 +39,10 @@ def _assert_failure(tmp_path, data, root, fragment):
 def test_reference_corridor_worlds_validate_bidirectionally():
     assert validate_obstacle_world(STATIC_YAML, STATIC_SDF) == (True, [])
     assert validate_obstacle_world(DYNAMIC_YAML, DYNAMIC_SDF) == (True, [])
+    assert validate_obstacle_world(
+        PACKAGE / "config/simple_obstacles.yaml",
+        PACKAGE / "worlds/my_rgl_simple.sdf",
+    ) == (True, [])
 
 
 @pytest.mark.parametrize(
