@@ -1,0 +1,46 @@
+"""ROS/PX4 workspace construction smoke test; skipped when dependencies are absent."""
+
+import importlib.util
+import pytest
+
+REQUIRED = ("rclpy", "px4_msgs", "casadi", "numpy", "tf2_ros", "yaml")
+pytestmark = pytest.mark.skipif(
+    any(importlib.util.find_spec(name) is None for name in REQUIRED),
+    reason="requires sourced ROS 2, px4_msgs, NumPy and CasADi/IPOPT workspace",
+)
+
+
+def test_ros_nodes_construct_and_expose_independent_timers():
+    import rclpy
+    from uto_ros2.px4_offboard_bridge_node import PX4OffboardBridge
+    from uto_ros2.uto_planner_node import UTOPlannerNode
+    from uto_ros2.ifds_planner_node import IFDSPlannerNode
+    from uto_ros2.validation_metrics_node import ValidationMetricsNode
+
+    rclpy.init()
+    planner = bridge = ifds = metrics = None
+    try:
+        planner = UTOPlannerNode()
+        bridge = PX4OffboardBridge()
+        ifds = IFDSPlannerNode()
+        metrics = ValidationMetricsNode()
+        assert planner.planning_timer is not planner.commit_timer
+        assert planner.get_parameter("commit_check_rate").value == 50.0
+        assert bridge.get_parameter("setpoint_rate").value == 40.0
+        assert bridge.get_parameter("offboard_control_level").value == "position"
+        assert bridge.get_parameter("vehicle_status_topic").value.endswith("vehicle_status_v4")
+        assert bridge.get_parameter("vehicle_local_position_topic").value.endswith(
+            "vehicle_local_position_v1"
+        )
+        assert ifds.get_parameter("planner_only").value is True
+        assert metrics.get_parameter("terminal_average_window").value == 0.5
+    finally:
+        if planner is not None:
+            planner.destroy_node()
+        if bridge is not None:
+            bridge.destroy_node()
+        if ifds is not None:
+            ifds.destroy_node()
+        if metrics is not None:
+            metrics.destroy_node()
+        rclpy.shutdown()

@@ -1,0 +1,57 @@
+ifds_planner:
+  ros__parameters:
+    # Required for matching Gazebo oscillator time to IFDS obstacle time.
+    use_sim_time: true
+    # Data-flow switch: false uses GNSS odometry; true uses FAST-LIO2 odometry
+    # from the RGL LiDAR -> converter node -> FAST-LIO2 chain.
+    gnss_denied: false
+    gnss_odom_topic: /x500/gnss/odometry
+    fast_lio_odom_topic: /Odometry
+
+    goal_topic: /ifds/goal
+    path_topic: /ifds/local_path
+    setpoint_topic: /mavros/setpoint_position/local
+    status_topic: /ifds/status
+    obstacle_updates_topic: /ifds/obstacles
+    frame_id: map
+    planning_rate_hz: 2.0
+    # Carrot chasing runs independently at a higher rate than re-planning.
+    setpoint_rate_hz: 30.0
+    lookahead_distance: 2.5
+    yaw_rate_limit: 1.0
+    max_setpoint_speed: 3.0
+
+    # IFDS tuning ported from new_dynamic/default_config.m.
+    rho0: 2.5
+    sigma0: 0.01
+    cruise_speed: 2.0
+    dt: 0.1
+    max_iterations: 1000
+    target_threshold: 1.0
+    delta_g: 2.0
+    alpha_deg: 0.0
+    shape_following: false
+    min_gamma: 1.02
+
+    # Corridor planar-wall modulation.
+    # Walls only affect IFDS when a wall entry is present in the selected obstacle YAML.
+    wall_modulation_gain: 1.5
+    wall_influence_distance: 1.0
+
+    # Obstacle and optimiser modes.
+    # dynamic_obstacles=false keeps YAML centers fixed; true enables evaluation of
+    # known obstacle center/velocity motion, refreshed once per re-plan.
+    dynamic_obstacles: false
+    # IFDS velocity formulation:
+    # normal   -> u_bar = M u
+    # relative -> u_bar = M (u - v_obs) + v_obs
+    # Relative mode uses only instantaneous obstacle velocity;
+    # it does not predict future obstacle motion.
+    velocity_mode: normal
+    # optimizer_mode=0 uses fixed rho0/sigma0; optimizer_mode=2 uses lightweight local optimisation.
+    optimizer_mode: 0
+    local_optimizer_period_steps: 5
+
+    # Paper-faithful fallback: a failed complete IFDS re-plan clears the path and
+    # keeps the Offboard stream alive with a hold setpoint until the next plan cycle.
+    hold_on_failure: true

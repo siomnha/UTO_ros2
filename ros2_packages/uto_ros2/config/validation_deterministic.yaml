@@ -1,0 +1,7 @@
+uto_planner:
+  ros__parameters:
+    planner_mode: deterministic
+    mode: global
+    global_one_shot: true
+    global_replan_enabled: false
+    delay_compensation_enabled: false
