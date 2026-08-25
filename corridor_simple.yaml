@@ -1,0 +1,40 @@
+header:
+  frame_id: map
+
+obstacles:
+  - name: corridor_wall_left
+    type: wall
+    axis: y
+    boundary: 3.425
+    inside_sign: -1
+
+  - name: corridor_wall_right
+    type: wall
+    axis: y
+    boundary: -3.425
+    inside_sign: 1
+
+  - name: corridor_wall_start
+    type: wall
+    axis: x
+    boundary: -3.0
+    inside_sign: 1
+
+  - name: corridor_wall_end
+    type: wall
+    axis: x
+    boundary: 12.425
+    inside_sign: -1
+
+  - name: corridor_ground_bound
+    type: wall
+    axis: z
+    boundary: 0.30
+    inside_sign: 1
+    allow_recovery: true
+
+  - name: static_obstacle_1
+    type: superellipsoid
+    center: [5.32173, -0.210448, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
