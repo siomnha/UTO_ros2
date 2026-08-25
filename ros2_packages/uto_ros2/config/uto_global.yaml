@@ -22,6 +22,7 @@ uto_planner:
 
     # Mode and one-shot behaviour
     mode: global
+    planner_mode: uto
     global_one_shot: true
     global_replan_enabled: false
     delay_compensation_enabled: false

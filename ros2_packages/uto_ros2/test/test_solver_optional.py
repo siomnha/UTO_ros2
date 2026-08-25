@@ -2,11 +2,26 @@ import importlib.util
 import numpy as np
 import pytest
 from uto_ros2.belief_adapter import sigma_states
-from uto_ros2.uto_nlp import UTONLP, UTOConfig
+from uto_ros2.uto_nlp import DeterministicNLP, UTONLP, UTOConfig
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("casadi") is None, reason="CasADi/IPOPT unavailable"
 )
+
+
+def test_deterministic_graph_is_single_trajectory_without_covariance_output():
+    nlp = DeterministicNLP(
+        UTOConfig(regions=1, nodes=2, references=2, max_iter=100, terminal_position_tolerance=0.5)
+    ).build()
+    initial = np.array([[0, 0, 1, 0, 0, 0, 0, 0, 0]], dtype=float).T
+    references = np.array([[0, 0, 1], [0, 0, 1]], dtype=float)
+    nlp.set_parameters(initial, references, 0.5, [0, 0, 0], [-1] * 3, [1] * 3, 1,
+                       [1, 1, 999, 0.01, 1e-6, 1e-6])
+    result = nlp.solve()
+    assert result["sigma_states_physical"].shape[1] == 1
+    assert result["terminal_covariance"] is None
+    assert result["objective_components"]["terminal_covariance"] == 0.0
+    assert result["planner_mode"] == "deterministic"
 
 
 def test_casadi_lgr_build_solve_and_parameter_reuse():

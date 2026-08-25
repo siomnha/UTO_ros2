@@ -21,6 +21,8 @@ from .planner_runtime import (
     Px4CommandSequencer,
     offboard_control_flags,
     px4_status_payload,
+    px4_bridge_topic_defaults,
+    status_dropout_action,
 )
 from .trajectory import ExecutionSetpoint, Trajectory, TrajectoryExecution
 
@@ -38,6 +40,12 @@ class PX4OffboardBridge(Node):
         self.last_publish_time = None
         self.max_jitter = 0.0
         self.setpoint_publish_count = 0
+        self.takeoff_completed_latched = False
+        self.was_connected = False
+        self.status_dropout_count = 0
+        self.status_dropout_during_trajectory_count = 0
+        self.trajectory_aborted_on_dropout = False
+        self.hold_reference_source = "takeoff"
         self.execution = TrajectoryExecution([0.0, 0.0, self._parameter("hold_altitude")])
         self.sequencer = Px4CommandSequencer(
             self._parameter("auto_arm_takeoff"),
@@ -57,8 +65,6 @@ class PX4OffboardBridge(Node):
             "offboard_control_mode_topic": "/fmu/in/offboard_control_mode",
             "trajectory_setpoint_topic": "/fmu/in/trajectory_setpoint",
             "vehicle_command_topic": "/fmu/in/vehicle_command",
-            "vehicle_status_topic": "/fmu/out/vehicle_status_v1",
-            "vehicle_local_position_topic": "/fmu/out/vehicle_local_position_v1",
             "vehicle_command_ack_topic": "/fmu/out/vehicle_command_ack",
             "setpoint_rate": 40.0,
             "offboard_control_level": "position",
@@ -67,13 +73,14 @@ class PX4OffboardBridge(Node):
             "prestream_setpoints": 20,
             "hold_position_tolerance": 0.2,
             "hold_velocity_tolerance": 0.25,
-            "px4_status_timeout": 0.5,
+            "px4_status_timeout": 2.0,
             "command_retry_interval": 0.5,
             "command_ack_timeout": 1.0,
             "command_max_retries": 5,
             "target_system": 1,
             "target_component": 1,
         }
+        defaults.update(px4_bridge_topic_defaults())
         for name, value in defaults.items():
             if not self.has_parameter(name):
                 self.declare_parameter(name, value)
@@ -115,6 +122,10 @@ class PX4OffboardBridge(Node):
             10,
         )
         self.timer = self.create_timer(1.0 / self._parameter("setpoint_rate"), self._on_timer)
+        self.get_logger().info(f"PX4 VehicleStatus: {self._parameter('vehicle_status_topic')}")
+        self.get_logger().info(
+            f"PX4 VehicleLocalPosition: {self._parameter('vehicle_local_position_topic')}"
+        )
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -166,7 +177,7 @@ class PX4OffboardBridge(Node):
             [self.local_position.vy, self.local_position.vx, -self.local_position.vz]
         )
         target = self.execution.takeoff_hold.state[:3]
-        if self.sequencer.state == CommandState.READY:
+        if self.takeoff_completed_latched:
             target = self.execution.terminal_hold.state[:3]
         return np.linalg.norm(position - target) <= self._parameter(
             "hold_position_tolerance"
@@ -176,6 +187,17 @@ class PX4OffboardBridge(Node):
         now = self._now()
         self._record_jitter(now)
         connected = self._connected(now)
+        if self.was_connected and not connected:
+            self.status_dropout_count += 1
+            active = self.execution.trajectory is not None
+            if active:
+                self.status_dropout_during_trajectory_count += 1
+            action = status_dropout_action(self.takeoff_completed_latched, active)
+            if action in ("ABORT_TRAJECTORY_HOLD_LAST", "HOLD_LAST"):
+                self.execution.request_hold_current()
+                self.trajectory_aborted_on_dropout = active
+                self.hold_reference_source = "last_valid"
+        self.was_connected = connected
         failsafe = bool(getattr(self.status, "failsafe", False)) if connected else False
         if not failsafe:
             self._publish_heartbeat()
@@ -194,13 +216,22 @@ class PX4OffboardBridge(Node):
         )
         if command is not None:
             self._publish_command(command)
+        if self.sequencer.state == CommandState.READY:
+            self.takeoff_completed_latched = True
         # Do not override PX4's own setpoints once its failsafe is asserted.
         if not failsafe:
             output = self.execution.select(
                 now,
                 trajectory_allowed=self.sequencer.state == CommandState.READY,
-                takeoff_complete=self.sequencer.state == CommandState.READY,
+                takeoff_complete=self.takeoff_completed_latched,
             )
+            self.hold_reference_source = {
+                "TAKEOFF_HOLD": "takeoff",
+                "TERMINAL_HOLD": "terminal",
+                "HOLD_CURRENT": "last_valid",
+                "EMERGENCY_HOLD": "emergency",
+                "TRAJECTORY": "last_valid",
+            }.get(output.mode, self.hold_reference_source)
             self._publish_exactly_one_setpoint(output)
         self._publish_status(now, connected, failsafe)
 
@@ -265,6 +296,11 @@ class PX4OffboardBridge(Node):
                 if self.execution.trajectory is not None
                 else 0.0
             ),
+            takeoff_completed_latched=self.takeoff_completed_latched,
+            status_dropout_count=self.status_dropout_count,
+            status_dropout_during_trajectory_count=self.status_dropout_during_trajectory_count,
+            trajectory_aborted_on_dropout=self.trajectory_aborted_on_dropout,
+            hold_reference_source=self.hold_reference_source,
         )
         self.state_pub.publish(String(data=json.dumps(payload)))
 

@@ -1,5 +1,6 @@
 uto_planner:
   ros__parameters:
+    planner_mode: uto
     use_sim_time: true
     belief_topic: /Odometry
     path_topic: /ifds/local_path

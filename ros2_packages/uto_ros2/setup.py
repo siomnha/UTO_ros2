@@ -19,6 +19,9 @@ setup(
             "uto_planner=uto_ros2.uto_planner_node:main",
             "px4_offboard_bridge=uto_ros2.px4_offboard_bridge_node:main",
             "ifds_planner=uto_ros2.ifds_planner_node:main",
+            "uto_validation_metrics=uto_ros2.validation_metrics_node:main",
+            "summarize_validation=uto_ros2.validation:summarize_main",
+            "uto_experiment_runner=uto_ros2.experiment_runner:main",
         ]
     },
 )

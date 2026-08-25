@@ -7,7 +7,7 @@ px4_offboard_bridge:
     offboard_control_mode_topic: /fmu/in/offboard_control_mode
     trajectory_setpoint_topic: /fmu/in/trajectory_setpoint
     vehicle_command_topic: /fmu/in/vehicle_command
-    vehicle_status_topic: /fmu/out/vehicle_status_v1
+    vehicle_status_topic: /fmu/out/vehicle_status_v4
     vehicle_local_position_topic: /fmu/out/vehicle_local_position_v1
     vehicle_command_ack_topic: /fmu/out/vehicle_command_ack
     setpoint_rate: 40.0
@@ -17,7 +17,7 @@ px4_offboard_bridge:
     prestream_setpoints: 20
     hold_position_tolerance: 0.20
     hold_velocity_tolerance: 0.25
-    px4_status_timeout: 0.50
+    px4_status_timeout: 2.00
     command_retry_interval: 0.50
     command_ack_timeout: 1.00
     command_max_retries: 5

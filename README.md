@@ -278,3 +278,81 @@ Before real flight, validate FAST-LIO covariance block ordering and twist validi
 TF/time synchronization, the selected world/YAML pairing, PX4 message fields and
 ACK behavior, offboard failsafes, and all four global/online × GNSS-supported/
 GNSS-denied SITL combinations.
+
+## Deterministic TO versus UTO validation
+
+`planner_mode` is the only planner-formulation selector and accepts `uto` or
+`deterministic`. UTO retains seven simplex trajectories for the six-dimensional
+position/attitude uncertainty and adds terminal position-covariance trace to the
+shared objective. Deterministic TO builds a genuinely separate one-state-trajectory
+graph: it has no sigma trajectories, sigma dynamics constraints, or covariance
+objective. Both formulations share the 9-D physical dynamics, LGR grid, references,
+scaling, bounds, IPOPT options, and the non-covariance weights. Weight order remains:
+
+```yaml
+weights: [path, terminal_position, covariance,
+          terminal_velocity, control_effort, control_smoothness]
+```
+
+DTO ignores only the third entry. Both publish `uto_trajectory/v1`, so the PX4
+bridge has one execution path. Run either formulation with:
+
+```bash
+ros2 launch uto_ros2 uto_ifds_gazebo.launch.py \
+  mode:=global planner_mode:=deterministic gnss_denied:=true \
+  uto_belief_topic:=/Odometry
+# replace deterministic with uto for UTO
+```
+
+PX4 message versions are configured independently. The SITL profile subscribes
+to `VehicleStatus` on `/fmu/out/vehicle_status_v4` and
+`VehicleLocalPosition` on `/fmu/out/vehicle_local_position_v1`; changing one
+parameter does not rewrite the other. `px4_status_timeout` defaults to 2 s.
+After READY, a status dropout latches takeoff completion, aborts the old timed
+trajectory, and holds the last valid reference instead of returning to the
+takeoff point. Bridge status reports dropout counters, abort state, and hold source.
+
+### Passive metrics and paired seeds
+
+`uto_validation_metrics` subscribes to parameterized Gazebo ground truth,
+FAST-LIO belief, trajectory, diagnostics, PX4 status, mission goal, and reliable
+transient-local `/validation/trial_context`. **Only Gazebo ground truth** is used
+for terminal and tracking error; `/Odometry` is planner belief, not truth.
+Each finish/abort atomically updates:
+
+* `validation_runs.csv` — one row per trial, including failures;
+* `validation_summary.json` — bias, RMSE, sample covariance (`N-1`), trace,
+  p95, success rate, timing, tracking, and attitude-rate statistics;
+* `validation_matrices.npz` — `terminal_positions_DTO/UTO` (`N×3`, metres),
+  `terminal_errors_DTO/UTO` (`N`, metres), `terminal_mean_DTO/UTO` (`3`, metres),
+  `terminal_covariance_DTO/UTO` (`3×3`, m²), and
+  `paired_error_difference` (`N`, metres, UTO minus DTO).
+
+With fewer than two successful trials, covariance is JSON `null` and the NPZ
+matrix is NaN with a warning. Rebuild outputs from an interrupted CSV with:
+
+```bash
+ros2 run uto_ros2 summarize_validation \
+  --input ~/uto_validation_results/validation_runs.csv
+```
+
+Generate the default ten paired samples with:
+
+```bash
+ros2 launch uto_ros2 validation_experiment.launch.py sample_count:=10 base_seed:=1
+```
+
+The supplied runner is simulation-only, defaults to dry-run, records the actual
+six-dimensional error vector, and orders each seed as DTO then UTO. Set
+`sample_count` to 30, 50, or 100 to extend the same experiment. Full restart is
+the required reset strategy because planner, IFDS, PX4, and FAST-LIO retain
+state. This repository does **not** contain a verified Gazebo Harmonic
+set-entity-state interface: automatic runs therefore abort with
+`INITIAL_STATE_INJECTION_UNCONFIRMED` unless an external, confirmed injector is
+provided. Processes created by the runner use their own process group and are
+stopped with SIGINT followed by scoped SIGTERM; it never uses `pkill`/`killall`.
+Neither the metrics node nor dry-run runner publishes flight setpoints.
+The runner readiness contract is event-driven—advancing `/clock`, PX4 connection
+and hold readiness, stable belief, valid IFDS status, committed trajectory,
+execution completion, and `GOAL_REACHED` each have a distinct timeout reason;
+fixed sleeps are not treated as readiness evidence.

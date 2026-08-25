@@ -1,0 +1,13 @@
+uto_validation_metrics:
+  ros__parameters:
+    use_sim_time: true
+    ground_truth_topic: /model/x500/odometry
+    belief_topic: /Odometry
+    trajectory_topic: /uto/trajectory
+    diagnostics_topic: /uto/diagnostics
+    px4_status_topic: /uto/px4_status
+    mission_goal_topic: /ifds/mission_goal
+    trial_context_topic: /validation/trial_context
+    trial_written_topic: /validation/trial_written
+    validation_output_directory: ~/uto_validation_results
+    terminal_average_window: 0.5

@@ -4,3 +4,10 @@ __pycache__/
 build/
 install/
 log/
+*.bag
+*.db3
+*.mcap
+validation_runs.csv
+validation_summary.json
+validation_matrices.npz
+experiment_plan.json

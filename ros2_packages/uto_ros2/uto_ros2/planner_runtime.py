@@ -106,6 +106,7 @@ class PlanningRequest:
     enqueue_monotonic: float = 0.0
     terminal_segment: bool = False
     commit_time_finalized: bool = True
+    planner_mode: str = "uto"
 
 
 def terminal_segment_matches_goal(
@@ -175,6 +176,21 @@ def px4_status_payload(**values) -> dict:
             value = value.item()
         payload[str(key)] = value
     return payload
+
+
+def px4_bridge_topic_defaults() -> dict:
+    """PX4 message-version topics are independent, never suffix-derived."""
+    return {
+        "vehicle_status_topic": "/fmu/out/vehicle_status_v4",
+        "vehicle_local_position_topic": "/fmu/out/vehicle_local_position_v1",
+    }
+
+
+def status_dropout_action(takeoff_completed: bool, trajectory_active: bool) -> str:
+    """Never return to the takeoff reference after READY was reached."""
+    if not takeoff_completed:
+        return "TAKEOFF_SAFETY"
+    return "ABORT_TRAJECTORY_HOLD_LAST" if trajectory_active else "HOLD_LAST"
 
 
 @dataclass(frozen=True)
@@ -273,7 +289,8 @@ class FeasibilityGate:
             reasons.append("state shape")
         if controls.ndim != 2 or controls.shape[1:] != (4,):
             reasons.append("control shape")
-        if sigma.ndim != 3 or sigma.shape[1:] != (7, 9):
+        expected_sigma = 1 if request.planner_mode == "deterministic" else 7
+        if sigma.ndim != 3 or sigma.shape[1:] != (expected_sigma, 9):
             reasons.append("sigma shape")
         if not all(np.all(np.isfinite(value)) for value in (states, controls, sigma, times)):
             reasons.append("non-finite")
@@ -943,6 +960,7 @@ PLANNER_PARAMETER_DEFAULTS = {
     "resume_service": "/uto/resume",
     "planning_frame": "map",
     "mode": "online",
+    "planner_mode": "uto",
     "global_one_shot": False,
     "global_replan_enabled": True,
     "delay_compensation_enabled": True,
@@ -1031,13 +1049,18 @@ class RuntimeComponents:
 def build_runtime_components(parameter: Callable[[str], object]) -> RuntimeComponents:
     """Construct startup-only math/runtime components from ROS parameters."""
     from .belief_adapter import BeliefAdapter, StabilityConfig
-    from .uto_nlp import UTOConfig, UTONLP
+    from .uto_nlp import DeterministicNLP, UTOConfig, UnscentedNLP
 
-    nlp = UTONLP(
+    planner_mode = str(parameter("planner_mode")).lower()
+    if planner_mode not in ("uto", "deterministic"):
+        raise ValueError("planner_mode must be 'uto' or 'deterministic'")
+
+    nlp_class = UnscentedNLP if planner_mode == "uto" else DeterministicNLP
+    nlp = nlp_class(
         UTOConfig(
             regions=parameter("regions"),
             nodes=parameter("lgr_nodes_per_region"),
-            sigma=parameter("sigma_count"),
+            sigma=parameter("sigma_count") if planner_mode == "uto" else 1,
             references=parameter("lookahead_count"),
             state_scale=tuple(parameter("state_scale")),
             control_scale=tuple(parameter("control_scale")),

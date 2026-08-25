@@ -1,6 +1,6 @@
-"""Reusable normalised 2-region LGR UTO graph ported from the MATLAB model."""
+"""Shared normalized LGR trajectory NLP plus deterministic and unscented graphs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib
 import time
 import numpy as np
@@ -29,12 +29,19 @@ class UTOConfig:
     acceptable_tolerance: float = 1e-4
 
 
-class UTONLP:
+class BaseTrajectoryNLP:
+    """Shared fixed-graph LGR trajectory NLP used by deterministic TO and UTO."""
+
+    planner_mode = "uto"
+    include_terminal_covariance = True
+
     def __init__(self, cfg=UTOConfig()):
         if (cfg.regions, cfg.nodes, cfg.sigma) != (2, 5, 7):
             # Tests may use smaller K, but flight defaults are the mandated dimensions.
             if min(cfg.regions, cfg.nodes, cfg.sigma) < 1:
                 raise ValueError("invalid startup dimensions")
+        if self.planner_mode == "deterministic" and cfg.sigma != 1:
+            cfg = replace(cfg, sigma=1)
         self.cfg = cfg
         self.opti = None
         self.build_count = 0
@@ -155,13 +162,21 @@ class UTONLP:
         objective = (
             self.p_weights[0] * path
             + self.p_weights[1] * terminal_position
-            + self.p_weights[2] * cov_cost
+            + (self.p_weights[2] * cov_cost if self.include_terminal_covariance else 0)
             + self.p_weights[3] * terminal_velocity
             + self.p_weights[4] * effort
             + self.p_weights[5] * smooth
         )
         o.minimize(objective)
         self.objective = objective
+        self.objective_components = {
+            "path": path,
+            "terminal_position": terminal_position,
+            "terminal_covariance": cov_cost if self.include_terminal_covariance else None,
+            "terminal_velocity": terminal_velocity,
+            "control_effort": effort,
+            "control_smoothness": smooth,
+        }
         o.solver(
             "ipopt",
             {"expand": True, "print_time": False},
@@ -309,26 +324,37 @@ class UTONLP:
         mean_rows = []
         covariance_rows = []
         for samples in sigma_samples:
-            sample_mean, mean_rotation, _ = reconstruct_belief_from_sigma(samples.T)
-            errors = samples - sample_mean[None, :]
-            for index, sample in enumerate(samples):
-                errors[index, 6:9] = so3_log(mean_rotation.T @ euler_to_rot(sample[6:9]))
+            if self.include_terminal_covariance:
+                sample_mean, mean_rotation, _ = reconstruct_belief_from_sigma(samples.T)
+                errors = samples - sample_mean[None, :]
+                for index, sample in enumerate(samples):
+                    errors[index, 6:9] = so3_log(mean_rotation.T @ euler_to_rot(sample[6:9]))
+                covariance_rows.append(errors.T @ errors / c.sigma)
+            else:
+                sample_mean = samples[0].copy()
             mean_rows.append(sample_mean)
-            covariance_rows.append(errors.T @ errors / c.sigma)
         mean = np.asarray(mean_rows)
-        covariance = np.asarray(covariance_rows)
+        covariance = np.asarray(covariance_rows) if covariance_rows else None
         maximum_residual = self._calculate_residual(
             normalized_blocks, physical_controls, float(self.opti.value(self.p_h))
         )
         self.extraction_time = time.perf_counter() - extract
         stats = solution.stats()
+        component_values = {
+            name: (float(solution.value(expression)) if expression is not None else 0.0)
+            for name, expression in self.objective_components.items()
+        }
         return {
+            "planner_mode": self.planner_mode,
             "times": np.asarray(times),
             "states_physical": mean,
             "sigma_states_physical": sigma_samples,
             "controls_physical": np.asarray(controls),
             "mean_covariances": covariance,
-            "terminal_covariance": covariance[-1],
+            "terminal_covariance": covariance[-1] if covariance is not None else None,
+            "objective_components": component_values,
+            "nlp_variable_count": int(o_value(self.opti, "nx")),
+            "nlp_constraint_count": int(o_value(self.opti, "ng")),
             "objective": float(solution.value(self.objective)),
             "stats": stats,
             "iterations": int(stats.get("iter_count", -1)),
@@ -376,3 +402,24 @@ class UTONLP:
             result["physical_control_blocks"],
             horizon,
         )
+
+
+def o_value(opti, name):
+    """Read CasADi Opti scalar dimensions across supported CasADi releases."""
+    value = getattr(opti, name)
+    return value() if callable(value) else value
+
+
+class UnscentedNLP(BaseTrajectoryNLP):
+    """Seven-trajectory, six-dimensional simplex UTO graph."""
+
+
+class UTONLP(UnscentedNLP):
+    """Backward-compatible name for the unscented NLP."""
+
+
+class DeterministicNLP(BaseTrajectoryNLP):
+    """Single physical-state trajectory with no sigma or covariance objective."""
+
+    planner_mode = "deterministic"
+    include_terminal_covariance = False

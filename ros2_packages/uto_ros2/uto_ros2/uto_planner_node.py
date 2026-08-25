@@ -105,6 +105,7 @@ class UTOPlannerNode(Node):
         self.last_commit_lateness = 0.0
         self.last_commit_errors = None
         self.last_timing = None
+        self.last_result = None
         self.last_completion_queue_time = 0.0
         self.last_request_to_commit_time = 0.0
         self.candidate_request_time = None
@@ -668,18 +669,29 @@ class UTOPlannerNode(Node):
         if delay_enabled:
             delay = self.delay.estimate(first, self._parameter("cold_start_delay"))
             predicted_commit_time = snapshot.now + delay
-        sigma, mean, rotation, covariance = select_planning_initial_state(
-            snapshot.belief,
-            delay_enabled,
-            lambda: self.delay.propagate(
-                snapshot.belief.sigma_states,
-                snapshot.belief.stamp,
-                predicted_commit_time,
-                self._control_at,
-                self._parameter("process_noise_diagonal"),
-            ),
-        )
-        if delay_enabled:
+        planner_mode = self._parameter("planner_mode")
+        if planner_mode == "deterministic":
+            mean = snapshot.belief.mean_state.copy()
+            rotation = snapshot.belief.rotation.copy()
+            covariance = snapshot.belief.covariance.copy()
+            sigma = mean[:, None]
+        else:
+            sigma, mean, rotation, covariance = select_planning_initial_state(
+                snapshot.belief,
+                delay_enabled,
+                lambda: self.delay.propagate(
+                    snapshot.belief.sigma_states,
+                    snapshot.belief.stamp,
+                    predicted_commit_time,
+                    self._control_at,
+                    self._parameter("process_noise_diagonal"),
+                ),
+            )
+        if planner_mode == "deterministic":
+            commit_time = predicted_commit_time
+            self.planning_initial_state_source = "fast_lio_belief_mean"
+            self.commit_policy = "predicted_commit_time" if delay_enabled else "post_solve_hold_continuity"
+        elif delay_enabled:
             commit_time = predicted_commit_time
             self.planning_initial_state_source = "delay_compensated_belief"
             self.commit_policy = "predicted_commit_time"
@@ -734,6 +746,7 @@ class UTOPlannerNode(Node):
             time.perf_counter(),
             terminal_segment,
             delay_enabled,
+            planner_mode,
         )
 
     def _should_request_plan(self, snapshot: PlannerSnapshot) -> bool:
@@ -867,6 +880,7 @@ class UTOPlannerNode(Node):
         self.delay.record_latency(admission_latency)
         gate = result.gate_result
         solve_result = result.solve_result
+        self.last_result = solve_result
         self.last_gate = gate
         post_solve_global = bool(
             self._global_one_shot_mode()
@@ -1052,6 +1066,21 @@ class UTOPlannerNode(Node):
             response.message = "resume rejected: FAULT or readiness conditions not met"
         return response
 
+    def _objective_component(self, name: str):
+        if not self.last_result:
+            return None
+        return self.last_result.get("objective_components", {}).get(name)
+
+    def _terminal_position_covariance(self):
+        if not self.last_result or self._parameter("planner_mode") == "deterministic":
+            return None
+        covariance = self.last_result.get("terminal_covariance")
+        return np.asarray(covariance)[:3, :3].tolist() if covariance is not None else None
+
+    def _terminal_covariance_trace(self):
+        covariance = self._terminal_position_covariance()
+        return float(np.trace(covariance)) if covariance is not None else None
+
     def _publish_diagnostics(self, reason: str = "", level: str = "OK") -> None:
         gate = self.last_gate
         first_delay = self.buffer.active is None and self.state in (
@@ -1062,6 +1091,23 @@ class UTOPlannerNode(Node):
         projection = self.delay.last_projection
         payload = {
             "state": self.state.name,
+            "planner_mode": self._parameter("planner_mode"),
+            "physical_state_dimension": 9,
+            "uncertainty_dimension": 6 if self._parameter("planner_mode") == "uto" else 0,
+            "sigma_trajectory_count": 7 if self._parameter("planner_mode") == "uto" else 1,
+            "nlp_variable_count": self.last_result.get("nlp_variable_count", 0) if self.last_result else 0,
+            "nlp_constraint_count": self.last_result.get("nlp_constraint_count", 0) if self.last_result else 0,
+            "objective_path": self._objective_component("path"),
+            "objective_terminal_position": self._objective_component("terminal_position"),
+            "objective_terminal_covariance": self._objective_component("terminal_covariance"),
+            "objective_terminal_velocity": self._objective_component("terminal_velocity"),
+            "objective_control_effort": self._objective_component("control_effort"),
+            "objective_control_smoothness": self._objective_component("control_smoothness"),
+            "predicted_terminal_mean": (
+                self.last_result["states_physical"][-1].tolist() if self.last_result else []
+            ),
+            "predicted_terminal_position_covariance": self._terminal_position_covariance(),
+            "predicted_terminal_position_covariance_trace": self._terminal_covariance_trace(),
             "global_one_shot": self._parameter("global_one_shot"),
             "global_replan_enabled": self._parameter("global_replan_enabled"),
             "delay_compensation_enabled": self._parameter("delay_compensation_enabled"),

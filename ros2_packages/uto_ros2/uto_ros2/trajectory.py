@@ -35,7 +35,7 @@ class Trajectory:
         if not np.all(np.isfinite(self.states)) or not np.all(np.isfinite(self.controls)):
             raise ValueError("trajectory contains non-finite values")
         if self.mean_covariances is None:
-            self.mean_covariances = np.zeros((len(self.times), 9, 9))
+            return
         self.mean_covariances = np.asarray(self.mean_covariances, dtype=float)
         if self.mean_covariances.shape != (len(self.times), 9, 9):
             raise ValueError("covariances must have shape [samples,9,9]")
@@ -79,7 +79,9 @@ class Trajectory:
             "times": self.times.tolist(),
             "states_physical": self.states.tolist(),
             "controls_physical": self.controls.tolist(),
-            "mean_covariances": self.mean_covariances.tolist(),
+            "mean_covariances": (
+                self.mean_covariances.tolist() if self.mean_covariances is not None else None
+            ),
         }
 
     def to_json(self) -> str:

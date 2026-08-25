@@ -51,6 +51,7 @@ def _nodes(context):
             package="uto_ros2", executable="uto_planner", name="uto_planner", output="screen",
             parameters=[os.path.join(share, "config", f"uto_{mode}.yaml"), uto_common, {
                 "belief_topic": LaunchConfiguration("uto_belief_topic"),
+                "planner_mode": LaunchConfiguration("planner_mode"),
                 "path_topic": "/ifds/local_path", "path_status_topic": "/ifds/path_status",
                 "mission_goal_topic": "/ifds/mission_goal",
             }],
@@ -70,6 +71,7 @@ def generate_launch_description():
         DeclareLaunchArgument("mode", default_value="online", choices=["global", "online"]),
         DeclareLaunchArgument("gnss_denied", default_value="true", choices=["true", "false"]),
         DeclareLaunchArgument("uto_belief_topic", default_value="/Odometry"),
+        DeclareLaunchArgument("planner_mode", default_value="uto", choices=["uto", "deterministic"]),
         DeclareLaunchArgument("ifds_params", default_value=""),
         DeclareLaunchArgument("ifds_obstacles", default_value=""),
         DeclareLaunchArgument("world_sdf", default_value=""),
