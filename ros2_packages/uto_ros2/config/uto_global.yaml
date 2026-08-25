@@ -27,8 +27,8 @@ uto_planner:
     global_replan_enabled: false
     delay_compensation_enabled: false
 
-    # Full mission reference: (6 - 1) * 2.0 = 10 m
-    lookahead_count: 6
+    # Full mission reference sampled independently from the 10 LGR nodes.
+    lookahead_count: 20
     lookahead_spacing: 2.0
     horizon: 10.0
     terminal_goal_match_tolerance: 0.10
@@ -53,7 +53,8 @@ uto_planner:
 
     # Terminal constraints
     terminal_position_tolerance: 0.30
-    terminal_velocity_tolerance: 0.05
+    terminal_velocity_tolerance: 0.03
+    terminal_roll_pitch_tolerance: 0.05
 
     # Control, state, and normalization
     velocity_max: 4.0
@@ -93,7 +94,7 @@ uto_planner:
     # Goal and dwell
     goal_position_tolerance: 0.20
     goal_velocity_tolerance: 0.20
-    goal_yaw_enabled: false
+    goal_yaw_enabled: true
     goal_yaw_tolerance: 0.20
     goal_dwell_time: 1.0
 

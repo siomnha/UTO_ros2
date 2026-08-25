@@ -356,3 +356,21 @@ The runner readiness contract is event-driven—advancing `/clock`, PX4 connecti
 and hold readiness, stable belief, valid IFDS status, committed trajectory,
 execution completion, and `GOAL_REACHED` each have a distinct timeout reason;
 fixed sleeps are not treated as readiness evidence.
+
+### Global full-reference and terminal contract
+
+Global one-shot uses 20 fixed reference parameters with 2×5 LGR nodes. Each
+collocation node is mapped by its normalized physical time across the complete
+reference sequence and linearly interpolates its adjacent parameters; the final
+LGR region therefore contributes the last reference interval instead of using
+only references 0–9. The fixed graph is still built once and later goals only
+update parameter values.
+
+DTO and UTO share the same terminal feasibility contract: Euclidean position
+error is constrained to `terminal_position_tolerance`, final-segment speed is
+constrained by its 2-norm, and terminal mean roll/pitch is bounded by
+`terminal_roll_pitch_tolerance`. When an explicit final mission yaw is enabled,
+it is lifted to the nearest equivalent 2π branch relative to the frozen initial
+yaw and constrained by `goal_yaw_tolerance`. Non-final online segments retain
+component velocity bounds and use wide yaw plus `angle_max` roll/pitch bounds,
+so this global hover policy does not force intermediate segments to hover.

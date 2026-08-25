@@ -24,6 +24,33 @@ def test_deterministic_graph_is_single_trajectory_without_covariance_output():
     assert result["planner_mode"] == "deterministic"
 
 
+@pytest.mark.parametrize("nlp_class,sigma_count", [(DeterministicNLP, 1), (UTONLP, 7)])
+def test_final_hover_roll_pitch_speed_and_yaw_constraints(nlp_class, sigma_count):
+    nlp = nlp_class(
+        UTOConfig(regions=1, nodes=2, sigma=sigma_count, references=2, max_iter=200,
+                  terminal_position_tolerance=0.3)
+    ).build()
+    state = np.array([0, 0, 1, 0, 0, 0, 0.10, -0.10, 0.30], dtype=float)
+    initial = np.repeat(state[:, None], sigma_count, axis=1)
+    references = np.array([[0, 0, 1], [0, 0, 1]], dtype=float)
+    nlp.set_parameters(
+        initial, references, 1.5, [0, 0, 0], [-4] * 3, [4] * 3, 1,
+        [1, 10, 10, 0.007, 1e-6, 1e-6], 0.3, 0.05, -0.20, 0.20, 0.03,
+    )
+    result = nlp.solve()
+    terminal = result["states_physical"][-1]
+    assert np.max(np.abs(terminal[6:8])) <= 0.05 + 1e-5
+    assert np.linalg.norm(terminal[3:6]) <= 0.03 + 1e-5
+    assert abs(np.arctan2(np.sin(terminal[8]), np.cos(terminal[8]))) <= 0.20 + 1e-5
+    build_count = nlp.build_count
+    nlp.set_parameters(
+        initial, references, 1.5, [0, 0, 0], [-4] * 3, [4] * 3, 1,
+        [1, 10, 10, 0.007, 1e-6, 1e-6], 0.3, 0.05, 0.20, 0.60, 0.03,
+    )
+    nlp.solve()
+    assert nlp.build_count == build_count == 1
+
+
 def test_casadi_lgr_build_solve_and_parameter_reuse():
     cfg = UTOConfig(
         regions=1, nodes=2, sigma=7, references=2, max_iter=100, terminal_position_tolerance=0.5

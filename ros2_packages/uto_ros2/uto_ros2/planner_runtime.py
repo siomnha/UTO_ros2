@@ -107,6 +107,66 @@ class PlanningRequest:
     terminal_segment: bool = False
     commit_time_finalized: bool = True
     planner_mode: str = "uto"
+    goal_yaw: Optional[float] = None
+
+
+def nearest_equivalent_yaw(goal_yaw: float, initial_yaw: float) -> float:
+    """Return the 2π-equivalent goal yaw nearest the frozen initial yaw."""
+    values = np.asarray([goal_yaw, initial_yaw], dtype=float)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("yaw values must be finite")
+    return float(goal_yaw + 2.0 * np.pi * round((initial_yaw - goal_yaw) / (2.0 * np.pi)))
+
+
+def wrapped_yaw_error(actual_yaw: float, goal_yaw: float) -> float:
+    return float(np.arctan2(np.sin(actual_yaw - goal_yaw), np.cos(actual_yaw - goal_yaw)))
+
+
+def terminal_parameter_policy(
+    final_segment: bool,
+    angle_max: float,
+    velocity_max: float,
+    roll_pitch_tolerance: float,
+    velocity_tolerance: float,
+    yaw_enabled: bool,
+    goal_yaw: Optional[float],
+    initial_yaw: float,
+    yaw_tolerance: float,
+) -> dict:
+    """Compute fixed-graph terminal bounds from one immutable request snapshot."""
+    if not final_segment:
+        return {
+            "roll_pitch_tolerance": angle_max,
+            "speed_tolerance": np.sqrt(3.0) * velocity_max,
+            "yaw_lower": -1.0e6,
+            "yaw_upper": 1.0e6,
+            "goal_yaw": None,
+        }
+    yaw_reference = None
+    if yaw_enabled and goal_yaw is not None:
+        yaw_reference = nearest_equivalent_yaw(goal_yaw, initial_yaw)
+    return {
+        "roll_pitch_tolerance": roll_pitch_tolerance,
+        "speed_tolerance": velocity_tolerance,
+        "yaw_lower": yaw_reference - yaw_tolerance if yaw_reference is not None else -1.0e6,
+        "yaw_upper": yaw_reference + yaw_tolerance if yaw_reference is not None else 1.0e6,
+        "goal_yaw": yaw_reference,
+    }
+
+
+def preflight_rejection_transition(attempt: int, maximum: int, path_available: bool):
+    """Return an explicit waiting state/reason after a rejected first candidate."""
+    if attempt >= maximum:
+        return (
+            PlannerState.WAIT_IFDS_INITIAL_PATH,
+            "preflight candidate rejected after maximum attempts",
+            True,
+        )
+    return (
+        PlannerState.BUILDING_NLP if path_available else PlannerState.WAIT_IFDS_INITIAL_PATH,
+        "",
+        False,
+    )
 
 
 def terminal_segment_matches_goal(
@@ -333,6 +393,11 @@ class FeasibilityGate:
                 states[-1, 3:6] > np.asarray(velocity_upper) + 1e-5
             ):
                 reasons.append("terminal velocity upper")
+            terminal_speed_limit = result.get("terminal_speed_limit")
+            if terminal_speed_limit is not None and np.linalg.norm(states[-1, 3:6]) > (
+                float(terminal_speed_limit) + 1e-5
+            ):
+                reasons.append("terminal speed")
         if controls.size:
             if np.any(controls < np.asarray(self.config.control_min) - 1e-5):
                 reasons.append("control lower bound")
@@ -1023,6 +1088,7 @@ PLANNER_PARAMETER_DEFAULTS = {
     "goal_dwell_time": 1.0,
     "terminal_position_tolerance": 0.3,
     "terminal_velocity_tolerance": 0.05,
+    "terminal_roll_pitch_tolerance": 0.05,
     "process_noise_diagonal": [0.01, 0.01, 0.01, 0.02, 0.02, 0.02, 0.001, 0.001, 0.001],
     "state_scale": [3.0, 1.0, 1.2, 4.0, 4.0, 4.0, 0.6, 0.6, 0.6],
     "control_scale": [9.81, 0.48, 0.48, 1.2],

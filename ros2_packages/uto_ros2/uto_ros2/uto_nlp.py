@@ -7,6 +7,25 @@ import numpy as np
 from .lgr import control_check_grid, lgr_operators, quadrature_weights, interpolation_matrix
 
 
+def reference_interpolation_schedule(tau, regions: int, references: int):
+    """Map every LGR node time onto a fixed full-reference parameter sequence."""
+    if regions < 1 or references < 2:
+        raise ValueError("reference schedule requires regions >= 1 and references >= 2")
+    schedule = []
+    for region in range(regions):
+        for value in np.asarray(tau, dtype=float):
+            alpha = (region + (value + 1.0) / 2.0) / regions
+            coordinate = float(np.clip(alpha, 0.0, 1.0) * (references - 1))
+            lower = min(int(np.floor(coordinate)), references - 1)
+            upper = min(lower + 1, references - 1)
+            schedule.append((region, lower, upper, coordinate - lower, alpha))
+    return schedule
+
+
+def terminal_position_within_tolerance(error, tolerance: float) -> bool:
+    return bool(np.dot(error, error) <= tolerance * tolerance)
+
+
 @dataclass(frozen=True)
 class UTOConfig:
     regions: int = 2
@@ -54,6 +73,9 @@ class BaseTrajectoryNLP:
         self.endpoint = interpolation_matrix(self.tau, [1.0])[:, 0]
         self.control_checks = control_check_grid(self.tau, cfg.control_check_points)
         self.control_interpolation = interpolation_matrix(self.tau, self.control_checks)
+        self.reference_schedule = reference_interpolation_schedule(
+            self.tau, cfg.regions, cfg.references
+        )
 
     def build(self):
         if self.opti is not None:
@@ -78,6 +100,10 @@ class BaseTrajectoryNLP:
         self.p_mode = o.parameter()
         self.p_weights = o.parameter(6)
         self.p_ptol = o.parameter()
+        self.p_terminal_rp_tolerance = o.parameter()
+        self.p_terminal_yaw_lower = o.parameter()
+        self.p_terminal_yaw_upper = o.parameter()
+        self.p_terminal_speed_tolerance = o.parameter()
         self.U = [o.variable(4, c.nodes) for _ in range(c.regions)]
         self.X = [[o.variable(9, c.nodes + 1) for _ in range(c.regions)] for _ in range(c.sigma)]
         duration = self.p_h / c.regions
@@ -140,8 +166,14 @@ class BaseTrajectoryNLP:
                     )
             for k in range(c.nodes):
                 mean = sum(ca.diag(sx) @ self.X[s][region][:, k] for s in range(c.sigma)) / c.sigma
-                ref_index = min(region * c.nodes + k, c.references - 1)
-                error = mean[:3] - self.p_ref[:, ref_index]
+                _, lower_index, upper_index, fraction, _ = self.reference_schedule[
+                    region * c.nodes + k
+                ]
+                reference = (
+                    (1.0 - fraction) * self.p_ref[:, lower_index]
+                    + fraction * self.p_ref[:, upper_index]
+                )
+                error = mean[:3] - reference
                 path += (duration / 2) * q[k] * ca.dot(error, error)
         terminal_states = [ca.diag(sx) @ self.X[s][-1][:, -1] for s in range(c.sigma)]
         self.terminal_mean = sum(terminal_states) / c.sigma
@@ -151,8 +183,26 @@ class BaseTrajectoryNLP:
         )
         goal = self.p_ref[:, -1]
         position_error = self.terminal_mean[:3] - goal
-        o.subject_to(o.bounded(-self.p_ptol, position_error, self.p_ptol))
+        o.subject_to(ca.dot(position_error, position_error) <= self.p_ptol * self.p_ptol)
         o.subject_to(o.bounded(self.p_vlo, self.terminal_mean[3:6], self.p_vhi))
+        o.subject_to(
+            ca.dot(self.terminal_mean[3:6], self.terminal_mean[3:6])
+            <= self.p_terminal_speed_tolerance * self.p_terminal_speed_tolerance
+        )
+        o.subject_to(
+            o.bounded(
+                -self.p_terminal_rp_tolerance,
+                self.terminal_mean[6:8],
+                self.p_terminal_rp_tolerance,
+            )
+        )
+        o.subject_to(
+            o.bounded(
+                self.p_terminal_yaw_lower,
+                self.terminal_mean[8],
+                self.p_terminal_yaw_upper,
+            )
+        )
         velocity_error = self.terminal_mean[3:6] - self.p_vref
         terminal_velocity = (1 - self.p_mode) * ca.dot(
             velocity_error, velocity_error
@@ -233,6 +283,10 @@ class BaseTrajectoryNLP:
         mode,
         weights,
         terminal_position_tolerance=None,
+        terminal_roll_pitch_tolerance=None,
+        terminal_yaw_lower=-1.0e6,
+        terminal_yaw_upper=1.0e6,
+        terminal_speed_tolerance=None,
     ):
         start = time.perf_counter()
         pairs = [
@@ -251,6 +305,20 @@ class BaseTrajectoryNLP:
                     if terminal_position_tolerance is None
                     else terminal_position_tolerance
                 ),
+            ),
+            (
+                self.p_terminal_rp_tolerance,
+                self.cfg.angle_max
+                if terminal_roll_pitch_tolerance is None
+                else terminal_roll_pitch_tolerance,
+            ),
+            (self.p_terminal_yaw_lower, terminal_yaw_lower),
+            (self.p_terminal_yaw_upper, terminal_yaw_upper),
+            (
+                self.p_terminal_speed_tolerance,
+                np.sqrt(3.0) * self.cfg.velocity_max
+                if terminal_speed_tolerance is None
+                else terminal_speed_tolerance,
             ),
         ]
         if pairs[0][1].shape != (9, self.cfg.sigma) or pairs[1][1].shape != (

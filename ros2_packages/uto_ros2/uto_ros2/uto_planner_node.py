@@ -45,6 +45,9 @@ from .planner_runtime import (
     planning_data_fresh,
     terminal_goal_data_fresh,
     terminal_segment_matches_goal,
+    terminal_parameter_policy,
+    wrapped_yaw_error,
+    preflight_rejection_transition,
     global_preflight_ready,
     global_post_solve_commit_time,
     global_one_shot_plan_allowed,
@@ -731,22 +734,23 @@ class UTOPlannerNode(Node):
             self.request_generation += 1
             generation = self.request_generation
         return PlanningRequest(
-            generation,
-            snapshot.path["generation"],
-            snapshot.belief.generation,
-            snapshot.now,
-            commit_time,
-            sigma,
-            mean,
-            rotation,
-            covariance,
-            references,
-            snapshot.path["polyline"],
-            first,
-            time.perf_counter(),
-            terminal_segment,
-            delay_enabled,
-            planner_mode,
+            request_generation=generation,
+            path_generation=snapshot.path["generation"],
+            belief_generation=snapshot.belief.generation,
+            request_time=snapshot.now,
+            commit_time=commit_time,
+            sigma_states=sigma,
+            predicted_mean=mean,
+            predicted_rotation=rotation,
+            predicted_covariance=covariance,
+            references=references,
+            path=snapshot.path["polyline"],
+            first=first,
+            enqueue_monotonic=time.perf_counter(),
+            terminal_segment=terminal_segment,
+            commit_time_finalized=delay_enabled,
+            planner_mode=planner_mode,
+            goal_yaw=snapshot.mission_goal.yaw if snapshot.mission_goal else None,
         )
 
     def _should_request_plan(self, snapshot: PlannerSnapshot) -> bool:
@@ -802,12 +806,23 @@ class UTOPlannerNode(Node):
         self.nlp.build()
         terminal_tolerance = self._parameter("terminal_velocity_tolerance")
         final_mode = int(request.terminal_segment)
+        terminal_policy = terminal_parameter_policy(
+            request.terminal_segment,
+            self._parameter("angle_max"),
+            self._parameter("velocity_max"),
+            self._parameter("terminal_roll_pitch_tolerance"),
+            terminal_tolerance,
+            self._parameter("goal_yaw_enabled"),
+            request.goal_yaw,
+            request.predicted_mean[8],
+            self._parameter("goal_yaw_tolerance"),
+        )
         velocity_reference = np.zeros(3)
         if not final_mode:
             velocity_reference = (request.references[-1] - request.references[-2]) / max(
                 self._parameter("lookahead_spacing"), 0.1
             )
-        bound = terminal_tolerance if final_mode else self._parameter("velocity_max")
+        bound = self._parameter("velocity_max")
         self.nlp.set_parameters(
             request.sigma_states,
             request.references,
@@ -818,11 +833,21 @@ class UTOPlannerNode(Node):
             final_mode,
             self._parameter("weights"),
             self._parameter("terminal_position_tolerance"),
+            terminal_policy["roll_pitch_tolerance"],
+            terminal_policy["yaw_lower"],
+            terminal_policy["yaw_upper"],
+            terminal_policy["speed_tolerance"],
         )
         prepare_time = time.perf_counter() - prepare_start
         result = self.nlp.solve()
         result["terminal_velocity_lower"] = np.full(3, -bound)
         result["terminal_velocity_upper"] = np.full(3, bound)
+        result["terminal_speed_limit"] = terminal_policy["speed_tolerance"]
+        result["terminal_goal_yaw"] = (
+            request.goal_yaw if terminal_policy["goal_yaw"] is not None else None
+        )
+        result["terminal_yaw_reference"] = terminal_policy["goal_yaw"]
+        result["terminal_goal_position"] = request.references[-1].copy()
         result["max_lgr_dynamics_residual"] = self.nlp.compute_residual(result)
         gate = self.gate.check(result, request, request.request_generation)
         completed = time.perf_counter()
@@ -929,11 +954,16 @@ class UTOPlannerNode(Node):
             self.state = PlannerState.TRAJECTORY_READY if request.first else PlannerState.REPLANNING
         elif request.first:
             self.first_request_submitted = False
-            self.state = (
-                PlannerState.BUILDING_NLP
-                if self.path is not None
-                else PlannerState.WAIT_IFDS_INITIAL_PATH
-            )
+            if self._global_one_shot_mode():
+                self.state, transition_reason, blocked = preflight_rejection_transition(
+                    self.global_preflight_attempt,
+                    self._parameter("global_preflight_max_attempts"),
+                    self.path is not None,
+                )
+                self.global_replan_blocked = blocked
+                reason = transition_reason or reason
+            else:
+                self.state = PlannerState.BUILDING_NLP if self.path is not None else PlannerState.WAIT_IFDS_INITIAL_PATH
         elif reason not in ("stale", "late") and self.buffer.remaining(now) <= 0:
             self.pending_safety_reason = "candidate admission failed"
         self._publish_diagnostics(reason)
@@ -1081,6 +1111,34 @@ class UTOPlannerNode(Node):
         covariance = self._terminal_position_covariance()
         return float(np.trace(covariance)) if covariance is not None else None
 
+    def _terminal_diagnostics(self) -> dict:
+        if not self.last_result:
+            return {
+                "predicted_terminal_position_error_norm": None,
+                "predicted_terminal_speed": None,
+                "predicted_terminal_roll": None,
+                "predicted_terminal_pitch": None,
+                "predicted_terminal_yaw": None,
+                "terminal_goal_yaw": None,
+                "terminal_yaw_error_wrapped": None,
+            }
+        terminal = np.asarray(self.last_result["states_physical"][-1], dtype=float)
+        goal_position = np.asarray(self.last_result["terminal_goal_position"], dtype=float)
+        goal_yaw = self.last_result.get("terminal_goal_yaw")
+        return {
+            "predicted_terminal_position_error_norm": float(
+                np.linalg.norm(terminal[:3] - goal_position)
+            ),
+            "predicted_terminal_speed": float(np.linalg.norm(terminal[3:6])),
+            "predicted_terminal_roll": float(terminal[6]),
+            "predicted_terminal_pitch": float(terminal[7]),
+            "predicted_terminal_yaw": float(terminal[8]),
+            "terminal_goal_yaw": float(goal_yaw) if goal_yaw is not None else None,
+            "terminal_yaw_error_wrapped": (
+                wrapped_yaw_error(terminal[8], goal_yaw) if goal_yaw is not None else None
+            ),
+        }
+
     def _publish_diagnostics(self, reason: str = "", level: str = "OK") -> None:
         gate = self.last_gate
         first_delay = self.buffer.active is None and self.state in (
@@ -1089,6 +1147,7 @@ class UTOPlannerNode(Node):
             PlannerState.TRAJECTORY_READY,
         )
         projection = self.delay.last_projection
+        terminal_diagnostics = self._terminal_diagnostics()
         payload = {
             "state": self.state.name,
             "planner_mode": self._parameter("planner_mode"),
@@ -1108,6 +1167,11 @@ class UTOPlannerNode(Node):
             ),
             "predicted_terminal_position_covariance": self._terminal_position_covariance(),
             "predicted_terminal_position_covariance_trace": self._terminal_covariance_trace(),
+            **terminal_diagnostics,
+            "terminal_position_tolerance": self._parameter("terminal_position_tolerance"),
+            "terminal_velocity_tolerance": self._parameter("terminal_velocity_tolerance"),
+            "terminal_roll_pitch_tolerance": self._parameter("terminal_roll_pitch_tolerance"),
+            "terminal_yaw_tolerance": self._parameter("goal_yaw_tolerance"),
             "global_one_shot": self._parameter("global_one_shot"),
             "global_replan_enabled": self._parameter("global_replan_enabled"),
             "delay_compensation_enabled": self._parameter("delay_compensation_enabled"),
@@ -1198,6 +1262,10 @@ class UTOPlannerNode(Node):
                 self.buffer.candidate.path_generation if self.buffer.candidate else None
             ),
             "max_lgr_dynamics_residual": gate.max_lgr_dynamics_residual if gate else None,
+            "max_lgr_mean_path_error": gate.max_path_error if gate else None,
+            "max_lgr_sigma_path_error": gate.max_sigma_path_error if gate else None,
+            "path_tube_radius": self._parameter("path_tube_radius"),
+            "sigma_path_tube_radius": self._parameter("sigma_path_tube_radius"),
             "gate_time": gate.elapsed if gate else 0.0,
             "gate_accepted": gate.accepted if gate else None,
             "gate_reasons": gate.reasons if gate else [],
