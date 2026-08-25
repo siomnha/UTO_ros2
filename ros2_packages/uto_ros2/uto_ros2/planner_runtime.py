@@ -6,7 +6,7 @@ from enum import Enum, auto
 import threading
 import queue
 import time
-from typing import Callable
+from typing import Callable, Optional
 import numpy as np
 from .belief_adapter import joint_sigma_process_update
 from .dynamics import rk4
@@ -216,6 +216,7 @@ class WorkerResult:
 
 @dataclass
 class GateConfig:
+    enable_dense_rollout_gate: bool = True
     velocity_max: float = 4.0
     angle_max: float = 0.6
     control_min: tuple = (0.0, -0.48, -0.48, -1.2)
@@ -241,13 +242,15 @@ class GateResult:
     max_path_error: float
     max_sigma_path_error: float
     max_lgr_dynamics_residual: float
-    max_dense_mean_path_error: float
-    max_dense_sigma_path_error: float
-    max_dense_velocity: float
-    max_dense_attitude: float
-    max_dense_endpoint_position_error: float
-    max_dense_endpoint_velocity_error: float
-    max_dense_endpoint_attitude_error: float
+    max_dense_mean_path_error: Optional[float]
+    max_dense_sigma_path_error: Optional[float]
+    max_dense_velocity: Optional[float]
+    max_dense_attitude: Optional[float]
+    max_dense_endpoint_position_error: Optional[float]
+    max_dense_endpoint_velocity_error: Optional[float]
+    max_dense_endpoint_attitude_error: Optional[float]
+    dense_rollout_gate_enabled: bool
+    dense_rollout_gate_skipped: bool
 
 
 class FeasibilityGate:
@@ -329,23 +332,26 @@ class FeasibilityGate:
             reasons.append("mean path tube")
         if sigma_error > self.config.sigma_path_tube:
             reasons.append("sigma path tube")
-        dense = self._dense_rollout(result, request)
-        if dense[0] > self.config.path_tube:
-            reasons.append("dense mean path tube")
-        if dense[1] > self.config.sigma_path_tube:
-            reasons.append("dense sigma path tube")
-        if dense[2] > self.config.velocity_max + 1e-5:
-            reasons.append("dense velocity bound")
-        if dense[3] > self.config.angle_max + 1e-5:
-            reasons.append("dense attitude bound")
-        if dense[4] > self.config.rollout_endpoint_position_tolerance:
-            reasons.append("rollout endpoint position")
-        if dense[5] > self.config.rollout_endpoint_velocity_tolerance:
-            reasons.append("rollout endpoint velocity")
-        if dense[6] > self.config.rollout_endpoint_attitude_tolerance:
-            reasons.append("rollout endpoint attitude")
-        if dense[7]:
-            reasons.append("dense control bound")
+        dense_metrics = (None,) * 7
+        if self.config.enable_dense_rollout_gate:
+            dense = self._dense_rollout(result, request)
+            dense_metrics = dense[:7]
+            if dense[0] > self.config.path_tube:
+                reasons.append("dense mean path tube")
+            if dense[1] > self.config.sigma_path_tube:
+                reasons.append("dense sigma path tube")
+            if dense[2] > self.config.velocity_max + 1e-5:
+                reasons.append("dense velocity bound")
+            if dense[3] > self.config.angle_max + 1e-5:
+                reasons.append("dense attitude bound")
+            if dense[4] > self.config.rollout_endpoint_position_tolerance:
+                reasons.append("rollout endpoint position")
+            if dense[5] > self.config.rollout_endpoint_velocity_tolerance:
+                reasons.append("rollout endpoint velocity")
+            if dense[6] > self.config.rollout_endpoint_attitude_tolerance:
+                reasons.append("rollout endpoint attitude")
+            if dense[7]:
+                reasons.append("dense control bound")
         return GateResult(
             not reasons,
             reasons,
@@ -353,7 +359,9 @@ class FeasibilityGate:
             mean_error,
             sigma_error,
             residual,
-            *dense[:7],
+            *dense_metrics,
+            self.config.enable_dense_rollout_gate,
+            not self.config.enable_dense_rollout_gate,
         )
 
     def _dense_rollout(self, result: dict, request: PlanningRequest) -> tuple:
@@ -969,6 +977,7 @@ PLANNER_PARAMETER_DEFAULTS = {
     "sigma_count": 7,
     "control_check_points_per_region": 31,
     "gate_dense_points_per_region": 15,
+    "enable_dense_rollout_gate": True,
     "gate_rollout_endpoint_position_tolerance": 0.3,
     "gate_rollout_endpoint_velocity_tolerance": 0.5,
     "gate_rollout_endpoint_attitude_tolerance": 0.2,
@@ -1069,6 +1078,7 @@ def build_runtime_components(parameter: Callable[[str], object]) -> RuntimeCompo
     manager = CandidateManager(buffer, parameter("commit_guard"))
     gate = FeasibilityGate(
         GateConfig(
+            enable_dense_rollout_gate=parameter("enable_dense_rollout_gate"),
             velocity_max=parameter("velocity_max"),
             angle_max=parameter("angle_max"),
             control_min=tuple(parameter("control_min")),

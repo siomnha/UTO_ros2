@@ -202,7 +202,7 @@ Global startup is deliberately preflight-only:
 PX4 READY at takeoff hold
 → stable FAST-LIO belief + valid mission goal + valid static IFDS path
 → freeze current hold belief (no delay propagation or delay process noise)
-→ build NLP → IPOPT → dense feasibility gate
+→ build NLP → IPOPT → non-dense LGR feasibility gates
 → latest-hold-belief continuity check
 → set commit time to now + 0.10 s
 → publish and execute the complete trajectory
@@ -237,9 +237,36 @@ ros2 topic pub --once /ifds/goal geometry_msgs/msg/PoseStamped \
 ros2 topic echo /uto/diagnostics
 ```
 
-The trajectory topic is published only after solver status, dense gate, and
-post-solve continuity all succeed. During flight, diagnostics report
+The trajectory topic is published only after solver status, the enabled
+feasibility checks, and post-solve continuity all succeed. During flight, diagnostics report
 `global_trajectory_committed=true` and `global_replan_blocked=true`.
+
+### Experimental global static-world dense-rollout switch
+
+The supplied simple-world global profile sets
+`enable_dense_rollout_gate: false`. This skips only the independent RK4 dense
+rollout checks (dense mean/sigma path tube, velocity/attitude/control bounds,
+and rollout-to-LGR endpoint errors). It does **not** bypass admission: solver
+status, shapes/finite values, time/horizon, request generation, LGR dynamics
+residual, extracted LGR state/control/path/terminal checks, covariance and
+post-solve hold continuity, IFDS validity, commit policy, and PX4 failsafe
+handling remain active.
+
+Skipped metrics are emitted as JSON `null`, with
+`dense_rollout_gate_enabled=false` and `dense_rollout_gate_skipped=true`; `0.0`
+is never used to imply that an unexecuted check had zero error. This is an
+explicit execution-chain experiment for the current Gazebo simple static world.
+It does not demonstrate independent real-dynamics or PX4 closed-loop validity
+and is unsuitable for dynamic obstacles, narrow environments, or real flight.
+Online mode explicitly keeps the gate enabled. Re-enable it with:
+
+```yaml
+enable_dense_rollout_gate: true
+```
+
+The gate is constructed from startup parameters. Changing
+`enable_dense_rollout_gate` requires restarting `uto_planner`; this package does
+not claim that `ros2 param set` rebuilds the gate at runtime.
 
 Pure tests cover the original-core regression oracle, no-obstacle/wall/
 superellipsoid/dynamic/velocity/optimizer behavior, original YAML, SDF contracts,

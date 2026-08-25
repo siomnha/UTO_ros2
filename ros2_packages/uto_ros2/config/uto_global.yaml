@@ -63,6 +63,8 @@ uto_planner:
     control_scale: [9.81, 0.48, 0.48, 1.2]
 
     # Dense feasibility and path gates
+    # Experimental simple-world setting: retain all LGR/non-dense gates but skip RK4 rollout.
+    enable_dense_rollout_gate: false
     gate_dense_points_per_region: 15
     gate_rollout_endpoint_position_tolerance: 0.30
     gate_rollout_endpoint_velocity_tolerance: 0.50

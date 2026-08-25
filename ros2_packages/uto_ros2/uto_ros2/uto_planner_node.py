@@ -1155,6 +1155,16 @@ class UTOPlannerNode(Node):
             "gate_time": gate.elapsed if gate else 0.0,
             "gate_accepted": gate.accepted if gate else None,
             "gate_reasons": gate.reasons if gate else [],
+            "dense_rollout_gate_enabled": (
+                gate.dense_rollout_gate_enabled
+                if gate
+                else self._parameter("enable_dense_rollout_gate")
+            ),
+            "dense_rollout_gate_skipped": (
+                gate.dense_rollout_gate_skipped
+                if gate
+                else not self._parameter("enable_dense_rollout_gate")
+            ),
             "max_dense_mean_path_error": gate.max_dense_mean_path_error if gate else None,
             "max_dense_sigma_path_error": gate.max_dense_sigma_path_error if gate else None,
             "max_dense_velocity": gate.max_dense_velocity if gate else None,

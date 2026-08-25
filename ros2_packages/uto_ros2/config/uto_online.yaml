@@ -71,6 +71,7 @@ uto_planner:
     source_clock_tolerance: 0.50
     px4_velocity_time_mode: offset
     gate_dense_points_per_region: 15
+    enable_dense_rollout_gate: true
     gate_rollout_endpoint_position_tolerance: 0.30
     gate_rollout_endpoint_velocity_tolerance: 0.50
     gate_rollout_endpoint_attitude_tolerance: 0.20
