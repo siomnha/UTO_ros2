@@ -1,0 +1,18 @@
+sample_count: 10
+base_seed: 1
+methods: [deterministic, uto]
+paired_samples: true
+initial_error_std:
+  position: [0.10, 0.10, 0.05]
+  attitude: [0.03, 0.03, 0.05]
+goal: [10.0, 0.0, 1.5]
+goal_frame: map
+reset_strategy: full_restart
+simulation_only: true
+allow_vehicle_commands: false
+dry_run: true
+validation_output_directory: ~/uto_validation_results
+startup_command: []
+readiness_timeout: 120.0
+execution_timeout: 120.0
+shutdown_timeout: 10.0

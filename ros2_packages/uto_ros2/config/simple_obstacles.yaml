@@ -1,0 +1,9 @@
+header:
+  frame_id: map
+
+obstacles:
+  - name: static_obstacle_1
+    type: superellipsoid
+    center: [5.32173, -0.210448, 1.0]
+    axes: [0.505, 0.5, 1.0]
+    exponents: [1.0, 1.0, 1.0]
